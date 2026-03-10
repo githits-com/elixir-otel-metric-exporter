@@ -22,6 +22,10 @@ defmodule OtelMetricExporter.MetricStore do
 
   @default_buckets [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
 
+  # Maximum number of generations to retain on export failure.
+  # Prevents unbounded ETS growth when the backend is unreachable.
+  @max_retained_generations 10
+
   defmodule State do
     @moduledoc false
     defstruct [:config, :api, :metrics, :metrics_table, :last_export, :generations_table, :aggregation_temporality]
@@ -100,7 +104,8 @@ defmodule OtelMetricExporter.MetricStore do
     :ets.update_element(metrics_table, ets_key, {2, value}, {ets_key, value, nil})
   end
 
-  def write_metric(metrics_table, %Metrics.Distribution{} = metric, string_name, value, tags) do
+  def write_metric(metrics_table, %Metrics.Distribution{} = metric, string_name, value, tags)
+      when is_number(value) do
     bucket = find_bucket(metric, value)
     generation = :persistent_term.get(generation_key(metrics_table))
     ets_key = {generation, string_name, metric_type(metric), tags, bucket}
@@ -113,6 +118,11 @@ defmodule OtelMetricExporter.MetricStore do
       [update_counter_op, update_sum_op],
       {ets_key, 0, 0}
     )
+  end
+
+  def write_metric(_metrics_table, %Metrics.Distribution{}, _string_name, value, _tags) do
+    Logger.debug("OtelMetricExporter: dropping distribution metric with non-numeric value: #{inspect(value)}")
+    :ok
   end
 
   def table_exists?(metrics_table) do
@@ -208,9 +218,22 @@ defmodule OtelMetricExporter.MetricStore do
         x -> x
       end
 
+    # Drop oldest generations if we've accumulated too many (backend unreachable)
+    {earliest_gen, dropped} = maybe_drop_old_generations(state, earliest_gen, current_gen)
+
+    if dropped > 0 do
+      Logger.warning(
+        "OtelMetricExporter dropped #{dropped} old metric generation(s) to prevent unbounded growth"
+      )
+    end
+
+    now = System.system_time(:nanosecond)
+
     earliest_gen..current_gen//1
     |> Enum.reduce(%{}, fn gen, acc ->
       {_, start, finish} = List.first(:ets.lookup(state.generations_table, gen), {nil, nil, nil})
+      # Use current time when generation end timestamp is nil (not yet rotated)
+      finish = finish || now
 
       get_metrics(state.metrics_table, gen)
       |> Map.new(fn {metric_key, values} ->
@@ -218,11 +241,15 @@ defmodule OtelMetricExporter.MetricStore do
       end)
       |> Map.merge(acc, fn _k, v1, v2 -> v2 ++ v1 end)
     end)
-    |> Enum.map(fn {{type, name}, tagged_values} ->
-      metric =
-        Enum.find(state.metrics, &(Enum.join(&1.name, ".") == name and metric_type(&1) == type))
+    |> Enum.flat_map(fn {{type, name}, tagged_values} ->
+      case Enum.find(state.metrics, &(Enum.join(&1.name, ".") == name and metric_type(&1) == type)) do
+        nil ->
+          Logger.warning("OtelMetricExporter: unknown metric #{inspect({type, name})}, skipping")
+          []
 
-      convert_metric(metric, tagged_values, state.aggregation_temporality)
+        metric ->
+          [convert_metric(metric, tagged_values, state.aggregation_temporality)]
+      end
     end)
     |> then(fn payload ->
       task = Task.async(fn -> OtelApi.send_metrics(state.api, payload) end)
@@ -246,6 +273,23 @@ defmodule OtelMetricExporter.MetricStore do
       {:error, reason} ->
         Logger.error("Failed to export metrics: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp maybe_drop_old_generations(state, earliest_gen, current_gen) do
+    total = current_gen - earliest_gen + 1
+
+    if total > @max_retained_generations do
+      drop_until = current_gen - @max_retained_generations + 1
+
+      for gen <- earliest_gen..(drop_until - 1)//1 do
+        :ets.match_delete(state.metrics_table, {{gen, :_, :_, :_, :_}, :_, :_})
+        :ets.delete(state.generations_table, gen)
+      end
+
+      {drop_until, drop_until - earliest_gen}
+    else
+      {earliest_gen, 0}
     end
   end
 
