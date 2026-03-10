@@ -63,6 +63,15 @@ defmodule OtelMetricExporter do
                         default: :otel_metric_exporter,
                         doc:
                           "If you require multiple exporters, give each exporter a unique name."
+                      ],
+                      aggregation_temporality: [
+                        type: {:in, [:cumulative, :delta]},
+                        default: :cumulative,
+                        doc:
+                          "OTLP aggregation temporality for exported metrics. " <>
+                            "Use :delta for backends that expect delta semantics (e.g. Datadog). " <>
+                            "Use :cumulative (default) for Prometheus-style backends. " <>
+                            "Gauges (LastValue) are unaffected as they have no temporality."
                       ]
                     ] ++ OtelApi.public_options()
                   )

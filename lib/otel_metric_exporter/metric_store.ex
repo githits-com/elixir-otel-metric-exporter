@@ -24,7 +24,7 @@ defmodule OtelMetricExporter.MetricStore do
 
   defmodule State do
     @moduledoc false
-    defstruct [:config, :api, :metrics, :metrics_table, :last_export, :generations_table]
+    defstruct [:config, :api, :metrics, :metrics_table, :last_export, :generations_table, :aggregation_temporality]
 
     @type t :: %__MODULE__{
             config: map(),
@@ -32,7 +32,8 @@ defmodule OtelMetricExporter.MetricStore do
             metrics: list(),
             metrics_table: atom(),
             generations_table: :ets.tid(),
-            last_export: nil | DateTime.t()
+            last_export: nil | DateTime.t(),
+            aggregation_temporality: :cumulative | :delta
           }
   end
 
@@ -145,6 +146,8 @@ defmodule OtelMetricExporter.MetricStore do
     :ets.insert(generations_table, {0, System.system_time(:nanosecond), 0})
     :persistent_term.put(generation_key(metrics_table), 0)
 
+    aggregation_temporality = Map.get(config, :aggregation_temporality, :cumulative)
+
     with {:ok, api, config} <- OtelApi.new(Map.put(config, :finch, finch_pool), :metrics) do
       {:ok,
        %State{
@@ -152,7 +155,8 @@ defmodule OtelMetricExporter.MetricStore do
          api: api,
          metrics: metrics,
          metrics_table: metrics_table,
-         generations_table: generations_table
+         generations_table: generations_table,
+         aggregation_temporality: aggregation_temporality
        }}
     end
   end
@@ -218,7 +222,7 @@ defmodule OtelMetricExporter.MetricStore do
       metric =
         Enum.find(state.metrics, &(Enum.join(&1.name, ".") == name and metric_type(&1) == type))
 
-      convert_metric(metric, tagged_values)
+      convert_metric(metric, tagged_values, state.aggregation_temporality)
     end)
     |> then(fn payload ->
       task = Task.async(fn -> OtelApi.send_metrics(state.api, payload) end)
@@ -247,17 +251,18 @@ defmodule OtelMetricExporter.MetricStore do
 
   defp convert_metric(
          %{name: name, description: description, unit: unit} = metric,
-         values
+         values,
+         aggregation_temporality
        ) do
     %Metric{
       name: Enum.join(name, "."),
       description: description,
       unit: convert_unit(unit),
-      data: convert_data(metric, values)
+      data: convert_data(metric, values, aggregation_temporality)
     }
   end
 
-  defp convert_data(%Metrics.Counter{}, values) do
+  defp convert_data(%Metrics.Counter{}, values, temporality) do
     {:sum,
      %Sum{
        data_points:
@@ -269,12 +274,12 @@ defmodule OtelMetricExporter.MetricStore do
              value: convert_value(value, :int)
            }
          end),
-       aggregation_temporality: :AGGREGATION_TEMPORALITY_CUMULATIVE,
+       aggregation_temporality: otlp_temporality(temporality),
        is_monotonic: true
      }}
   end
 
-  defp convert_data(%Metrics.Sum{}, values) do
+  defp convert_data(%Metrics.Sum{}, values, temporality) do
     {:sum,
      %Sum{
        data_points:
@@ -286,12 +291,12 @@ defmodule OtelMetricExporter.MetricStore do
              value: convert_value(value, :int)
            }
          end),
-       aggregation_temporality: :AGGREGATION_TEMPORALITY_CUMULATIVE,
+       aggregation_temporality: otlp_temporality(temporality),
        is_monotonic: false
      }}
   end
 
-  defp convert_data(%Metrics.LastValue{}, values) do
+  defp convert_data(%Metrics.LastValue{}, values, _temporality) do
     {:gauge,
      %Gauge{
        data_points:
@@ -306,7 +311,7 @@ defmodule OtelMetricExporter.MetricStore do
      }}
   end
 
-  defp convert_data(%Metrics.Distribution{reporter_options: opts}, values) do
+  defp convert_data(%Metrics.Distribution{reporter_options: opts}, values, temporality) do
     bucket_bounds = Keyword.get(opts, :buckets, @default_buckets)
     total_bucket_bounds = length(bucket_bounds)
 
@@ -333,9 +338,12 @@ defmodule OtelMetricExporter.MetricStore do
              explicit_bounds: bucket_bounds
            }
          end),
-       aggregation_temporality: :AGGREGATION_TEMPORALITY_CUMULATIVE
+       aggregation_temporality: otlp_temporality(temporality)
      }}
   end
+
+  defp otlp_temporality(:delta), do: :AGGREGATION_TEMPORALITY_DELTA
+  defp otlp_temporality(:cumulative), do: :AGGREGATION_TEMPORALITY_CUMULATIVE
 
   defp convert_unit(:unit), do: nil
   defp convert_unit(:second), do: "s"

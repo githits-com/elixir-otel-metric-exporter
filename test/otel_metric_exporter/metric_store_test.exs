@@ -237,4 +237,85 @@ defmodule OtelMetricExporter.MetricStoreTest do
       assert MetricStore.get_metrics(@name, 1) == %{}
     end
   end
+
+  describe "aggregation_temporality option" do
+    test "defaults to cumulative temporality", %{bypass: bypass, store_config: config} do
+      metrics = [metric] = [Metrics.sum("test.sum")]
+      start_supervised!({MetricStore, %{config | metrics: metrics}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = ExportMetricsServiceRequest.decode(body)
+        [%{scope_metrics: [%{metrics: [exported]}]}] = request.resource_metrics
+        {:sum, sum_data} = exported.data
+        assert sum_data.aggregation_temporality == :AGGREGATION_TEMPORALITY_CUMULATIVE
+
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, %{})
+      assert :ok = MetricStore.export_sync(@name)
+    end
+
+    test "uses delta temporality when configured", %{bypass: bypass, store_config: config} do
+      metrics = [sum_metric, counter_metric, dist_metric] = [
+        Metrics.sum("test.sum"),
+        Metrics.counter("test.counter"),
+        Metrics.distribution("test.dist", reporter_options: [buckets: [10, 100]])
+      ]
+
+      start_supervised!(
+        {MetricStore, config |> Map.put(:metrics, metrics) |> Map.put(:aggregation_temporality, :delta)}
+      )
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = ExportMetricsServiceRequest.decode(body)
+        [%{scope_metrics: [%{metrics: exported_metrics}]}] = request.resource_metrics
+
+        for exported <- exported_metrics do
+          case exported.data do
+            {:sum, sum_data} ->
+              assert sum_data.aggregation_temporality == :AGGREGATION_TEMPORALITY_DELTA
+
+            {:histogram, hist_data} ->
+              assert hist_data.aggregation_temporality == :AGGREGATION_TEMPORALITY_DELTA
+
+            {:gauge, _} ->
+              :ok
+          end
+        end
+
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      MetricStore.write_metric(@name, sum_metric, 5, %{})
+      MetricStore.write_metric(@name, counter_metric, 1, %{})
+      MetricStore.write_metric(@name, dist_metric, 50, %{})
+      assert :ok = MetricStore.export_sync(@name)
+    end
+
+    test "gauge metrics are unaffected by temporality setting", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metrics = [metric] = [Metrics.last_value("test.gauge")]
+
+      start_supervised!(
+        {MetricStore, config |> Map.put(:metrics, metrics) |> Map.put(:aggregation_temporality, :delta)}
+      )
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = ExportMetricsServiceRequest.decode(body)
+        [%{scope_metrics: [%{metrics: [exported]}]}] = request.resource_metrics
+        assert {:gauge, _} = exported.data
+
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      MetricStore.write_metric(@name, metric, 42, %{})
+      assert :ok = MetricStore.export_sync(@name)
+    end
+  end
 end
