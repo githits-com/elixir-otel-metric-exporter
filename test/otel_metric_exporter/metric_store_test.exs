@@ -309,7 +309,14 @@ defmodule OtelMetricExporter.MetricStoreTest do
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         request = ExportMetricsServiceRequest.decode(body)
         [%{scope_metrics: [%{metrics: [exported]}]}] = request.resource_metrics
-        assert {:gauge, _} = exported.data
+        assert {:gauge, gauge_data} = exported.data
+
+        # Gauge data points must have start_time_unix_nano = 0 to prevent
+        # Datadog from interpreting the value as a rate (value / time_interval).
+        for dp <- gauge_data.data_points do
+          assert dp.start_time_unix_nano == 0
+          assert dp.time_unix_nano > 0
+        end
 
         Plug.Conn.resp(conn, 200, "")
       end)

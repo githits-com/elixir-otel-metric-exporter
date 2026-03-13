@@ -344,10 +344,14 @@ defmodule OtelMetricExporter.MetricStore do
     {:gauge,
      %Gauge{
        data_points:
-         Enum.map(values, fn {{from, to}, tags, value} ->
+         Enum.map(values, fn {{_from, to}, tags, value} ->
            %NumberDataPoint{
              attributes: build_kv(tags),
-             start_time_unix_nano: from,
+             # Gauge data points must NOT set start_time_unix_nano.
+             # The Datadog Agent interprets a non-zero start time as a
+             # rate denominator, dividing the value by (time - start),
+             # which turns an absolute count into a per-second rate.
+             start_time_unix_nano: 0,
              time_unix_nano: to,
              value: convert_value(value, :double)
            }
