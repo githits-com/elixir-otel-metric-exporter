@@ -28,7 +28,7 @@ defmodule OtelMetricExporter.MetricStore do
 
   defmodule State do
     @moduledoc false
-    defstruct [:config, :api, :metrics, :metrics_table, :last_export, :generations_table, :aggregation_temporality]
+    defstruct [:config, :api, :metrics, :metric_lookup, :metrics_table, :last_export, :generations_table, :aggregation_temporality]
 
     @type t :: %__MODULE__{
             config: map(),
@@ -145,6 +145,12 @@ defmodule OtelMetricExporter.MetricStore do
   @impl true
   def init(config) do
     metrics = Map.get(config, :metrics, [])
+    # Precompute {type, name_string} -> metric lookup map to replace O(n²) scan during export
+    metric_lookup =
+      Map.new(metrics, fn metric ->
+        key = {metric_type(metric), Enum.join(metric.name, ".")}
+        {key, metric}
+      end)
     metrics_table = config.name
     finch_pool = Map.get(config, :finch_pool, OtelMetricExporter.Finch)
     Process.send_after(self(), :export, config.export_period)
@@ -164,6 +170,7 @@ defmodule OtelMetricExporter.MetricStore do
          config: config,
          api: api,
          metrics: metrics,
+         metric_lookup: metric_lookup,
          metrics_table: metrics_table,
          generations_table: generations_table,
          aggregation_temporality: aggregation_temporality
@@ -241,13 +248,13 @@ defmodule OtelMetricExporter.MetricStore do
       end)
       |> Map.merge(acc, fn _k, v1, v2 -> v2 ++ v1 end)
     end)
-    |> Enum.flat_map(fn {{type, name}, tagged_values} ->
-      case Enum.find(state.metrics, &(Enum.join(&1.name, ".") == name and metric_type(&1) == type)) do
-        nil ->
+    |> Enum.flat_map(fn {{type, name} = key, tagged_values} ->
+      case Map.fetch(state.metric_lookup, key) do
+        :error ->
           Logger.warning("OtelMetricExporter: unknown metric #{inspect({type, name})}, skipping")
           []
 
-        metric ->
+        {:ok, metric} ->
           [convert_metric(metric, tagged_values, state.aggregation_temporality)]
       end
     end)

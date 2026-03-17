@@ -141,12 +141,11 @@ defmodule OtelMetricExporter do
         name: name,
         handler_id: handler_id
       }) do
-    for metric <- metrics do
+    for {metric, metric_name} <- metrics do
       if is_nil(metric.keep) || metric.keep.(metadata) do
         value = extract_measurement(metric, measurements, metadata)
         tags = extract_tags(metric, metadata)
 
-        metric_name = "#{Enum.join(metric.name, ".")}"
         MetricStore.write_metric(name, metric, metric_name, value, tags)
       end
     end
@@ -174,4 +173,10 @@ defmodule OtelMetricExporter do
     |> metric.tag_values.()
     |> Map.take(metric.tags)
   end
+
+  @doc """
+  Precomputes the joined metric name string for a metric definition.
+  Used by TelemetryHandlers to avoid repeated Enum.join on every event.
+  """
+  def metric_name_string(metric), do: Enum.join(metric.name, ".")
 end
