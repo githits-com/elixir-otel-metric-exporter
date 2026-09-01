@@ -129,14 +129,12 @@ defmodule OtelMetricExporter.LogAccumulator do
       )
     end
 
-    # Remove the task from the pending tasks map
-    {:noreply, state}
+    {:noreply, complete_task(state, ref)}
   end
 
   def handle_info({:DOWN, ref, :process, _, _}, state)
       when is_map_key(state.pending_tasks, ref) do
-    # Remove the task from the pending tasks map
-    {:noreply, %{state | pending_tasks: Map.delete(state.pending_tasks, ref)}}
+    {:noreply, complete_task(state, ref)}
   end
 
   # Catch-all for unexpected messages. Without this, the process would crash on
@@ -191,13 +189,16 @@ defmodule OtelMetricExporter.LogAccumulator do
     # from a task that we started
     receive do
       {ref, _result} when is_map_key(pending_tasks, ref) ->
-        # Remove the task from the pending tasks map
-        %{state | pending_tasks: Map.delete(pending_tasks, ref)}
+        complete_task(state, ref)
 
       {:DOWN, ref, :process, _, _} when is_map_key(pending_tasks, ref) ->
-        # Remove the task from the pending tasks map
-        %{state | pending_tasks: Map.delete(pending_tasks, ref)}
+        complete_task(state, ref)
     end
+  end
+
+  defp complete_task(%{pending_tasks: pending_tasks} = state, ref) do
+    Process.demonitor(ref, [:flush])
+    %{state | pending_tasks: Map.delete(pending_tasks, ref)}
   end
 
   defp send_events_via_task(%{api: api, event_queue: queue} = state) do

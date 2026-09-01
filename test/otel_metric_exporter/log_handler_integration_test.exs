@@ -410,6 +410,69 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
     assert [%LogRecord{body: %{value: {:string_value, "debounce log"}}}] = logs
   end
 
+  @tag :task_lifecycle
+  test "continues exporting after a task result arrives before its DOWN", %{
+    bypass: bypass,
+    handler_id: handler_id,
+    config: initial_config
+  } do
+    config =
+      Map.merge(initial_config, %{
+        otlp_concurrent_requests: 1,
+        debounce_ms: 10,
+        max_buffer_size: 1
+      })
+
+    :ok = :logger.set_handler_config(handler_id, %{config: config})
+    parent = self()
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      %ExportLogsServiceRequest{resource_logs: [%{scope_logs: [%{log_records: logs}]}]} =
+        decode_request_body(body)
+
+      callback_pid = self()
+      send(parent, {:request, logs, callback_pid})
+
+      first_batch? =
+        Enum.any?(logs, &match?(%LogRecord{body: %{value: {:string_value, "first batch"}}}, &1))
+
+      second_batch? =
+        Enum.any?(logs, &match?(%LogRecord{body: %{value: {:string_value, "second batch"}}}, &1))
+
+      cond do
+        first_batch? ->
+          receive do
+            :release_first_request -> :ok
+          end
+
+        second_batch? ->
+          send(parent, :second_request_completed)
+
+        true ->
+          send(parent, :unexpected_request)
+      end
+
+      Plug.Conn.resp(conn, 200, "")
+    end)
+
+    Logger.info("first batch")
+
+    assert_receive {:request, [%LogRecord{body: %{value: {:string_value, "first batch"}}}],
+                    callback_pid},
+                   500
+
+    Logger.info("second batch")
+    send(callback_pid, :release_first_request)
+
+    assert_receive {:request, [%LogRecord{body: %{value: {:string_value, "second batch"}}}], _},
+                   500
+
+    assert_receive :second_request_completed, 500
+    refute_receive :unexpected_request, 100
+  end
+
   require OpenTelemetry.Tracer, as: Tracer
 
   test ":opentelemetry trace/span is captured correctly", %{bypass: bypass} do
