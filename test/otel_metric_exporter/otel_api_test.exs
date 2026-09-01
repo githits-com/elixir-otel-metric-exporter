@@ -166,6 +166,87 @@ defmodule OtelMetricExporter.OtelApiTest do
     refute_receive :unexpected_request, 100
   end
 
+  @tag :finch_worker_ownership
+  test "finch request worker is owned by its export task" do
+    bypass = Bypass.open()
+    endpoint = "http://localhost:#{bypass.port}"
+    {:ok, _} = start_supervised({Finch, name: OwnershipFinch, pools: %{endpoint => [size: 1]}})
+    {:ok, _} = start_supervised({Task.Supervisor, name: OwnershipTaskSupervisor})
+    parent = self()
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      send(parent, {:request_received, self()})
+
+      receive do
+        :release -> Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: OwnershipFinch,
+                 otlp_endpoint: endpoint,
+                 otlp_timeout: 10_000,
+                 retry: false
+               },
+               :logs
+             )
+
+    task =
+      Task.Supervisor.async_nolink(OwnershipTaskSupervisor, fn ->
+        OtelApi.send_log_events(api, [])
+      end)
+
+    task_pid = task.pid
+    task_ref = task.ref
+
+    assert_receive {:request_received, request_pid}, 5_000
+
+    {:monitors, monitors} = Process.info(task_pid, :monitors)
+
+    worker_pid =
+      Enum.find_value(monitors, fn
+        {:process, pid} when is_pid(pid) -> pid
+        _ -> nil
+      end)
+
+    assert is_pid(worker_pid)
+    {:links, links} = Process.info(task_pid, :links)
+    assert worker_pid in links
+
+    worker_ref = Process.monitor(worker_pid)
+    Process.exit(task_pid, :kill)
+
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, _reason}, 1_000
+    refute Process.alive?(worker_pid)
+    assert_receive {:DOWN, ^task_ref, :process, ^task_pid, :killed}, 1_000
+
+    send(request_pid, :release)
+    Bypass.pass(bypass)
+  end
+
+  test "unresolvable Finch name returns a bounded request error" do
+    {:ok, _} = start_supervised({Task.Supervisor, name: WorkerFailureTaskSupervisor})
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: MissingFinch,
+                 otlp_endpoint: "http://localhost:4317",
+                 retry: false
+               },
+               :logs
+             )
+
+    task =
+      Task.Supervisor.async_nolink(WorkerFailureTaskSupervisor, fn ->
+        OtelApi.send_log_events(api, [])
+      end)
+
+    assert {:ok, {:error, :request_failed}} = Task.yield(task, 1_000)
+  end
+
   @tag :otlp_deadline_handoff
   test "bounds a blocked request by the remaining absolute deadline" do
     bypass = Bypass.open()

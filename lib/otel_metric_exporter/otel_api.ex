@@ -158,10 +158,13 @@ defmodule OtelMetricExporter.OtelApi do
         request_ref = make_ref()
 
         {worker_pid, monitor_ref} =
-          spawn_monitor(fn ->
-            result = finch_request_in_worker(request, finch_pool, deadline)
-            send(parent, {request_ref, result})
-          end)
+          :erlang.spawn_opt(
+            fn ->
+              result = finch_request_in_worker(request, finch_pool, deadline)
+              send(parent, {request_ref, result})
+            end,
+            [:link, :monitor]
+          )
 
         await_finch_request(request_ref, worker_pid, monitor_ref, deadline)
 
@@ -186,8 +189,11 @@ defmodule OtelMetricExporter.OtelApi do
             if checkout_timeout?(error) do
               {:error, :pool_timeout}
             else
-              reraise(error, __STACKTRACE__)
+              {:error, :request_failed}
             end
+        catch
+          _kind, _reason ->
+            {:error, :request_failed}
         end
 
       :expired ->
@@ -218,6 +224,8 @@ defmodule OtelMetricExporter.OtelApi do
   end
 
   defp stop_finch_worker(request_ref, worker_pid, monitor_ref) do
+    # Owner-controlled cancellation must not propagate :killed back through the link.
+    Process.unlink(worker_pid)
     Process.exit(worker_pid, :kill)
 
     receive do
