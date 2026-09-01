@@ -4,6 +4,8 @@ defmodule OtelMetricExporter.OtelApi do
   alias OtelMetricExporter.OtelApi.Config
   alias OtelMetricExporter.Protocol
 
+  @opaque deadline :: integer()
+
   @retry_initial_delay 1_000
   @transient_statuses [408, 429, 500, 502, 503, 504]
   @finch_checkout_timeout_prefix "Finch was unable to provide a connection within the timeout"
@@ -23,6 +25,18 @@ defmodule OtelMetricExporter.OtelApi do
 
   defstruct [:finch, :retry, :config, :scope]
 
+  @spec new_deadline(%__MODULE__{}) :: deadline()
+  def new_deadline(%__MODULE__{config: %Config{otlp_timeout: timeout}}),
+    do: System.monotonic_time(:millisecond) + timeout
+
+  @spec remaining_timeout(deadline()) :: pos_integer() | :expired
+  def remaining_timeout(deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> remaining
+      _ -> :expired
+    end
+  end
+
   def public_options, do: Config.public_options()
 
   def new(opts, scope) do
@@ -39,24 +53,34 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
-  def send_log_events(%__MODULE__{config: config} = api, events) do
+  @spec send_log_events(%__MODULE__{}, list()) :: :ok | {:error, term()}
+  def send_log_events(%__MODULE__{} = api, events),
+    do: send_log_events(api, events, new_deadline(api))
+
+  @spec send_log_events(%__MODULE__{}, list(), deadline()) :: :ok | {:error, term()}
+  def send_log_events(%__MODULE__{config: config} = api, events, deadline) do
     events
     |> Protocol.build_log_service_request(config.resource)
-    |> send_proto("/v1/logs", api)
+    |> send_proto("/v1/logs", api, deadline)
   end
 
-  def send_metrics(%__MODULE__{config: config} = api, metrics) do
+  @spec send_metrics(%__MODULE__{}, list()) :: :ok | {:error, term()}
+  def send_metrics(%__MODULE__{} = api, metrics),
+    do: send_metrics(api, metrics, new_deadline(api))
+
+  @spec send_metrics(%__MODULE__{}, list(), deadline()) :: :ok | {:error, term()}
+  def send_metrics(%__MODULE__{config: config} = api, metrics, deadline) do
     metrics
     |> Protocol.build_metric_service_request(config.resource)
-    |> send_proto("/v1/metrics", api)
+    |> send_proto("/v1/metrics", api, deadline)
   end
 
-  @spec send_proto(struct(), String.t(), %__MODULE__{}) :: :ok | {:error, any()}
-  defp send_proto(body, path, %__MODULE__{} = api) do
+  @spec send_proto(struct(), String.t(), %__MODULE__{}, deadline()) :: :ok | {:error, term()}
+  defp send_proto(body, path, %__MODULE__{} = api, deadline) do
     body
     |> encode_to_iodata()
     |> build_finch_request(path, api)
-    |> make_finch_request(api.finch, api.config.otlp_timeout, with_retry?: api.retry)
+    |> make_finch_request(api.finch, deadline, with_retry?: api.retry)
   end
 
   def encode_to_iodata(body) do
@@ -82,9 +106,7 @@ defmodule OtelMetricExporter.OtelApi do
     )
   end
 
-  defp make_finch_request(request, finch_pool, receive_timeout, with_retry?: true) do
-    deadline = deadline(receive_timeout)
-
+  defp make_finch_request(request, finch_pool, deadline, with_retry?: true) do
     retry_delays =
       Retry.DelayStreams.exponential_backoff(@retry_initial_delay)
       |> Retry.DelayStreams.randomize()
@@ -92,8 +114,8 @@ defmodule OtelMetricExporter.OtelApi do
     request_with_retry(request, finch_pool, deadline, retry_delays)
   end
 
-  defp make_finch_request(request, finch_pool, receive_timeout, with_retry?: false) do
-    finch_request(request, finch_pool, deadline(receive_timeout))
+  defp make_finch_request(request, finch_pool, deadline, with_retry?: false) do
+    finch_request(request, finch_pool, deadline)
   end
 
   defp request_with_retry(request, finch_pool, deadline, retry_delays) do
@@ -223,15 +245,6 @@ defmodule OtelMetricExporter.OtelApi do
     do: String.starts_with?(message, @finch_checkout_timeout_prefix)
 
   defp timeout_error, do: {:error, %Mint.TransportError{reason: :timeout}}
-
-  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
-
-  defp remaining_timeout(deadline) do
-    case deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> remaining
-      _ -> :expired
-    end
-  end
 
   defp url(%__MODULE__{config: config}, path), do: config.otlp_endpoint <> path
 

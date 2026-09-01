@@ -126,6 +126,97 @@ defmodule OtelMetricExporter.OtelApiTest do
     send(request_pid, :release)
   end
 
+  test "does not send log or metric requests for an expired deadline" do
+    bypass = Bypass.open()
+    endpoint = "http://localhost:#{bypass.port}"
+    {:ok, _} = start_supervised({Finch, name: TestFinch, pools: %{endpoint => [size: 1]}})
+    parent = self()
+
+    Bypass.stub(bypass, "POST", "/v1/logs", fn conn ->
+      send(parent, :unexpected_request)
+      Plug.Conn.resp(conn, 200, "")
+    end)
+
+    Bypass.stub(bypass, "POST", "/v1/metrics", fn conn ->
+      send(parent, :unexpected_request)
+      Plug.Conn.resp(conn, 200, "")
+    end)
+
+    assert {:ok, logs_api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: endpoint, otlp_timeout: 1, retry: false},
+               :logs
+             )
+
+    assert {:ok, metrics_api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: endpoint, retry: false},
+               :metrics
+             )
+
+    deadline = OtelApi.new_deadline(logs_api)
+    Process.sleep(10)
+
+    assert {:error, %Mint.TransportError{reason: :timeout}} =
+             OtelApi.send_log_events(logs_api, [], deadline)
+
+    assert {:error, %Mint.TransportError{reason: :timeout}} =
+             OtelApi.send_metrics(metrics_api, [], deadline)
+
+    refute_receive :unexpected_request, 100
+  end
+
+  @tag :otlp_deadline_handoff
+  test "bounds a blocked request by the remaining absolute deadline" do
+    bypass = Bypass.open()
+    endpoint = "http://localhost:#{bypass.port}"
+    {:ok, _} = start_supervised({Finch, name: TestFinch, pools: %{endpoint => [size: 1]}})
+    parent = self()
+
+    Bypass.expect_once(bypass, "POST", "/warm", fn conn -> Plug.Conn.resp(conn, 200, "") end)
+
+    warm_request = Finch.build(:post, endpoint <> "/warm", [], <<>>)
+
+    assert {:ok, %{status: 200}} =
+             Finch.request(
+               warm_request,
+               TestFinch,
+               pool_timeout: 5_000,
+               receive_timeout: 5_000,
+               request_timeout: 5_000
+             )
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      send(parent, {:request_received, self()})
+
+      receive do
+        :release -> Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: TestFinch,
+                 otlp_endpoint: endpoint,
+                 otlp_timeout: 2_500,
+                 retry: false
+               },
+               :logs
+             )
+
+    deadline = OtelApi.new_deadline(api)
+    Process.sleep(1_200)
+    task = Task.async(fn -> OtelApi.send_log_events(api, [], deadline) end)
+
+    assert_receive {:request_received, request_pid}, 1_000
+    on_exit(fn -> send(request_pid, :release) end)
+    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 2_200)
+
+    Bypass.pass(bypass)
+    send(request_pid, :release)
+  end
+
   test "starts the first attempt immediately" do
     bypass = Bypass.open()
     endpoint = "http://localhost:#{bypass.port}"
