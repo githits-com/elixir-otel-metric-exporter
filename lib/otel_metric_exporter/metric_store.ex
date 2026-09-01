@@ -67,6 +67,7 @@ defmodule OtelMetricExporter.MetricStore do
     end)
   end
 
+  @spec export_sync(GenServer.name()) :: OtelApi.export_result()
   def export_sync(name) do
     GenServer.call(name, :export_sync, :infinity)
   end
@@ -187,13 +188,7 @@ defmodule OtelMetricExporter.MetricStore do
 
   @impl true
   def handle_call(:export_sync, _from, state) do
-    case export_metrics(state) do
-      :ok ->
-        {:reply, :ok, state}
-
-      error ->
-        {:reply, error, state}
-    end
+    {:reply, export_metrics(state), state}
   end
 
   @impl true
@@ -259,18 +254,32 @@ defmodule OtelMetricExporter.MetricStore do
     end)
     |> case do
       :ok ->
-        # Clear exported metrics
-        for x <- earliest_gen..current_gen//1 do
-          :ets.match_delete(state.metrics_table, {{x, :_, :_, :_, :_}, :_, :_})
-          :ets.delete(state.generations_table, x)
-        end
-
+        clear_exported_metrics(state, earliest_gen, current_gen)
         :ok
+
+      {:partial_success, _rejected_count} = result ->
+        clear_exported_metrics(state, earliest_gen, current_gen)
+        result
+
+      {:error, :invalid_response} = result ->
+        Logger.error("Failed to export metrics: :invalid_response")
+        clear_exported_metrics(state, earliest_gen, current_gen)
+        result
 
       {:error, reason} ->
         Logger.error("Failed to export metrics: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  @spec clear_exported_metrics(%State{}, non_neg_integer(), non_neg_integer()) :: :ok
+  defp clear_exported_metrics(state, earliest_gen, current_gen) do
+    for x <- earliest_gen..current_gen//1 do
+      :ets.match_delete(state.metrics_table, {{x, :_, :_, :_, :_}, :_, :_})
+      :ets.delete(state.generations_table, x)
+    end
+
+    :ok
   end
 
   defp convert_metric(

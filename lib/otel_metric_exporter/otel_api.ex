@@ -2,9 +2,24 @@ defmodule OtelMetricExporter.OtelApi do
   @moduledoc false
 
   alias OtelMetricExporter.OtelApi.Config
+
+  alias OtelMetricExporter.Opentelemetry.Proto.Collector.Logs.V1.{
+    ExportLogsPartialSuccess,
+    ExportLogsServiceResponse
+  }
+
+  alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.{
+    ExportMetricsPartialSuccess,
+    ExportMetricsServiceResponse
+  }
+
   alias OtelMetricExporter.Protocol
 
   @opaque deadline :: integer()
+  @type export_result ::
+          :ok
+          | {:partial_success, non_neg_integer()}
+          | {:error, term()}
 
   @retry_initial_delay 1_000
   @transient_statuses [408, 429, 500, 502, 503, 504]
@@ -53,34 +68,39 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
-  @spec send_log_events(%__MODULE__{}, list()) :: :ok | {:error, term()}
+  @spec send_log_events(%__MODULE__{}, list()) :: export_result()
   def send_log_events(%__MODULE__{} = api, events),
     do: send_log_events(api, events, new_deadline(api))
 
-  @spec send_log_events(%__MODULE__{}, list(), deadline()) :: :ok | {:error, term()}
+  @spec send_log_events(%__MODULE__{}, list(), deadline()) :: export_result()
   def send_log_events(%__MODULE__{config: config} = api, events, deadline) do
     events
     |> Protocol.build_log_service_request(config.resource)
     |> send_proto("/v1/logs", api, deadline)
   end
 
-  @spec send_metrics(%__MODULE__{}, list()) :: :ok | {:error, term()}
+  @spec send_metrics(%__MODULE__{}, list()) :: export_result()
   def send_metrics(%__MODULE__{} = api, metrics),
     do: send_metrics(api, metrics, new_deadline(api))
 
-  @spec send_metrics(%__MODULE__{}, list(), deadline()) :: :ok | {:error, term()}
+  @spec send_metrics(%__MODULE__{}, list(), deadline()) :: export_result()
   def send_metrics(%__MODULE__{config: config} = api, metrics, deadline) do
     metrics
     |> Protocol.build_metric_service_request(config.resource)
     |> send_proto("/v1/metrics", api, deadline)
   end
 
-  @spec send_proto(struct(), String.t(), %__MODULE__{}, deadline()) :: :ok | {:error, term()}
+  @spec send_proto(struct(), String.t(), %__MODULE__{}, deadline()) :: export_result()
   defp send_proto(body, path, %__MODULE__{} = api, deadline) do
-    body
-    |> encode_to_iodata()
-    |> build_finch_request(path, api)
-    |> make_finch_request(api.finch, deadline, with_retry?: api.retry)
+    request =
+      body
+      |> encode_to_iodata()
+      |> build_finch_request(path, api)
+
+    with {:ok, response_body} <-
+           make_finch_request(request, api.finch, deadline, with_retry?: api.retry) do
+      decode_response(response_body, api.scope)
+    end
   end
 
   def encode_to_iodata(body) do
@@ -120,8 +140,8 @@ defmodule OtelMetricExporter.OtelApi do
 
   defp request_with_retry(request, finch_pool, deadline, retry_delays) do
     case finch_request(request, finch_pool, deadline) do
-      :ok ->
-        :ok
+      {:ok, _response_body} = success ->
+        success
 
       {:error, {:unexpected_status, %{status: status}} = reason}
       when status not in @transient_statuses ->
@@ -242,7 +262,7 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
-  defp normalize_finch_response({:ok, %{status: 200}}), do: :ok
+  defp normalize_finch_response({:ok, %{status: 200, body: body}}), do: {:ok, body}
 
   defp normalize_finch_response({:ok, %{status: status}}),
     do: {:error, {:unexpected_status, %{status: status}}}
@@ -253,6 +273,47 @@ defmodule OtelMetricExporter.OtelApi do
     do: String.starts_with?(message, @finch_checkout_timeout_prefix)
 
   defp timeout_error, do: {:error, %Mint.TransportError{reason: :timeout}}
+
+  # The pinned protobuf decoder leaks MatchError while matching truncated fixed-width
+  # or length-delimited fields, so keep it inside the invalid-response boundary.
+  defp decode_response(body, :logs) do
+    case Protobuf.decode(body, ExportLogsServiceResponse) do
+      %ExportLogsServiceResponse{partial_success: nil} ->
+        :ok
+
+      %ExportLogsServiceResponse{
+        partial_success: %ExportLogsPartialSuccess{
+          rejected_log_records: rejected_count
+        }
+      } ->
+        normalize_partial_success(rejected_count)
+    end
+  rescue
+    Protobuf.DecodeError -> {:error, :invalid_response}
+    MatchError -> {:error, :invalid_response}
+  end
+
+  defp decode_response(body, :metrics) do
+    case Protobuf.decode(body, ExportMetricsServiceResponse) do
+      %ExportMetricsServiceResponse{partial_success: nil} ->
+        :ok
+
+      %ExportMetricsServiceResponse{
+        partial_success: %ExportMetricsPartialSuccess{
+          rejected_data_points: rejected_count
+        }
+      } ->
+        normalize_partial_success(rejected_count)
+    end
+  rescue
+    Protobuf.DecodeError -> {:error, :invalid_response}
+    MatchError -> {:error, :invalid_response}
+  end
+
+  defp normalize_partial_success(rejected_count) when rejected_count >= 0,
+    do: {:partial_success, rejected_count}
+
+  defp normalize_partial_success(_rejected_count), do: {:error, :invalid_response}
 
   @spec url(%__MODULE__{}, String.t()) :: String.t()
   defp url(

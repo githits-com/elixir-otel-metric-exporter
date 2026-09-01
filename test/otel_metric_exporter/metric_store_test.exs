@@ -3,6 +3,12 @@ defmodule OtelMetricExporter.MetricStoreTest do
   import ExUnit.CaptureLog
 
   alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.ExportMetricsServiceRequest
+
+  alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.{
+    ExportMetricsPartialSuccess,
+    ExportMetricsServiceResponse
+  }
+
   alias Telemetry.Metrics
   alias OtelMetricExporter.MetricStore
 
@@ -222,6 +228,66 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
       # Verify metrics were not cleared due to error
       assert MetricStore.get_metrics(@name, 0) == metrics
+    end
+
+    test "clears metrics and generations after partial success", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      tags = %{test: "value"}
+      start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        response = %ExportMetricsServiceResponse{
+          partial_success: %ExportMetricsPartialSuccess{
+            rejected_data_points: 1,
+            error_message: "receiver rejected points"
+          }
+        }
+
+        Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, tags)
+
+      assert {:partial_success, 1} = MetricStore.export_sync(@name)
+      assert MetricStore.get_metrics(@name, 0) == %{}
+
+      state = :sys.get_state(@name)
+      assert :ets.info(state.generations_table, :size) == 1
+    end
+
+    test "clears metrics and preserves the store after an invalid JSON response", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      tags = %{test: "value"}
+
+      store_pid =
+        start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 200, ~s({"partialSuccess":{}}))
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, tags)
+      assert MetricStore.get_metrics(@name, 0) != %{}
+
+      log =
+        capture_log(fn ->
+          assert {:error, :invalid_response} = MetricStore.export_sync(@name)
+        end)
+
+      assert log =~ "Failed to export metrics: :invalid_response"
+      assert Process.alive?(store_pid)
+      assert MetricStore.get_metrics(@name, 0) == %{}
+      assert MetricStore.get_metrics(@name, 1) == %{}
+      assert :persistent_term.get({MetricStore, @name, :generation}) == 1
+
+      state = :sys.get_state(@name)
+      assert :ets.info(state.generations_table, :size) == 1
     end
 
     test "preserves metrics across generations on failed exports", %{

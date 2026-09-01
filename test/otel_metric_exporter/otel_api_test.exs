@@ -1,5 +1,16 @@
 defmodule OtelMetricExporter.OtelApiTest do
   use ExUnit.Case, async: false
+
+  alias OtelMetricExporter.Opentelemetry.Proto.Collector.Logs.V1.{
+    ExportLogsPartialSuccess,
+    ExportLogsServiceResponse
+  }
+
+  alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.{
+    ExportMetricsPartialSuccess,
+    ExportMetricsServiceResponse
+  }
+
   alias OtelMetricExporter.OtelApi
   alias OtelMetricExporter.OtelApi.Config
 
@@ -482,6 +493,185 @@ defmodule OtelMetricExporter.OtelApiTest do
     assert_receive {:request_attempt, 2}, 2_000
     assert {:ok, :ok} = Task.yield(task, 1_000)
     assert Agent.get(attempts, & &1) == 2
+  end
+
+  test "returns log partial success without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    response = %ExportLogsServiceResponse{
+      partial_success: %ExportLogsPartialSuccess{
+        rejected_log_records: 3,
+        error_message: "receiver rejected records"
+      }
+    }
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :logs
+             )
+
+    assert {:partial_success, 3} = OtelApi.send_log_events(api, [])
+  end
+
+  test "returns metric partial success without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    response = %ExportMetricsServiceResponse{
+      partial_success: %ExportMetricsPartialSuccess{
+        rejected_data_points: 2,
+        error_message: "receiver rejected points"
+      }
+    }
+
+    Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+      Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :metrics
+             )
+
+    assert {:partial_success, 2} = OtelApi.send_metrics(api, [])
+  end
+
+  test "returns an explicit empty partial success without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    response = %ExportLogsServiceResponse{
+      partial_success: %ExportLogsPartialSuccess{}
+    }
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :logs
+             )
+
+    assert {:partial_success, 0} = OtelApi.send_log_events(api, [])
+  end
+
+  test "rejects a negative log partial-success count without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    response = %ExportLogsServiceResponse{
+      partial_success: %ExportLogsPartialSuccess{rejected_log_records: -1}
+    }
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :logs
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+  end
+
+  test "rejects a negative metric partial-success count without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    response = %ExportMetricsServiceResponse{
+      partial_success: %ExportMetricsPartialSuccess{rejected_data_points: -1}
+    }
+
+    Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+      Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :metrics
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
+  end
+
+  test "returns invalid response for malformed log response without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Plug.Conn.resp(conn, 200, "malformed response")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :logs
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+  end
+
+  test "returns invalid response for malformed metric response without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+      Plug.Conn.resp(conn, 200, "malformed response")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :metrics
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
+  end
+
+  test "returns invalid response for a JSON log response without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Plug.Conn.resp(conn, 200, ~s({"partialSuccess":{}}))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :logs
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+  end
+
+  test "returns invalid response for a JSON metric response without retrying" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+      Plug.Conn.resp(conn, 200, ~s({"partialSuccess":{}}))
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: TestFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :metrics
+             )
+
+    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
   end
 
   test "does not retry after the timeout budget is exhausted" do
