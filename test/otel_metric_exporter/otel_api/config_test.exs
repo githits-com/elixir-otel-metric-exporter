@@ -1,6 +1,8 @@
 defmodule OtelMetricExporter.OtelApi.ConfigTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   @touched_envs ~w|OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TIMEOUT| ++
                   ~w|OTEL_RESOURCE_ATTRIBUTES OTEL_SERVICE_NAME| ++
                   ~w|OTEL_EXPORTER_OTLP_LOGS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_PROTOCOL OTEL_EXPORTER_OTLP_LOGS_HEADERS OTEL_EXPORTER_OTLP_LOGS_TIMEOUT| ++
@@ -69,6 +71,117 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
                   otlp_timeout: 10000,
                   otlp_endpoint: "http://localhost:4317"
                 }}
+    end
+
+    test "parses encoded separators, additional equals, and optional whitespace" do
+      System.put_env(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        " alpha = one%2Ctwo , beta = literal=plus+%3D, gamma = lowercase%2cencoded%2b "
+      )
+
+      assert {:ok, %{otlp_headers: headers}} = OtelMetricExporter.OtelApi.Config.defaults()
+
+      assert headers == %{
+               "alpha" => "one,two",
+               "beta" => "literal=plus+=",
+               "gamma" => "lowercase,encoded+"
+             }
+    end
+
+    test "parses signal-specific headers" do
+      System.put_env("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "logs=one%2Ctwo")
+
+      assert {:ok, %{logs: %{otlp_headers: %{"logs" => "one,two"}}}} =
+               OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "preserves allowed spaces in header values" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer placeholder-token")
+
+      assert {:ok, %{otlp_headers: %{"authorization" => "Bearer placeholder-token"}}} =
+               OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "discards malformed header members" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "valid=value,malformed")
+
+      assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "discards headers with unsupported properties" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "key=value;property=unsupported")
+
+      assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "discards headers with malformed percent encoding" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "key=value%2")
+
+      assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "discards headers with decoded controls" do
+      secret = "control-placeholder"
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "key=#{secret}%0A")
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+        end)
+
+      assert log =~ "invalid_value"
+      refute log =~ secret
+    end
+
+    test "discards headers with decoded non-ASCII values" do
+      secret = "non-ascii-placeholder"
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "key=#{secret}%C3%A9")
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+        end)
+
+      assert log =~ "invalid_value"
+      refute log =~ secret
+    end
+
+    test "discards headers with invalid keys" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "invalid key=value")
+
+      assert {:ok, %{otlp_headers: %{}}} = OtelMetricExporter.OtelApi.Config.defaults()
+    end
+
+    test "redacts invalid header values from warnings" do
+      secret = "placeholder-secret-token"
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer #{secret}%ZZ")
+
+      log = capture_log(fn -> OtelMetricExporter.OtelApi.Config.defaults() end)
+
+      assert log =~ "OTEL_EXPORTER_OTLP_HEADERS"
+      assert log =~ "invalid_percent_encoding"
+      refute log =~ "authorization"
+      refute log =~ secret
+    end
+
+    test "treats empty signal-specific header env as unset" do
+      System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "generic=value")
+      System.put_env("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "")
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{otlp_headers: %{"generic" => "value"}, logs: %{exporter: :otlp}}} =
+                   OtelMetricExporter.OtelApi.Config.defaults()
+        end)
+
+      refute log =~ "Invalid OTEL_EXPORTER_OTLP_LOGS_HEADERS"
+    end
+
+    test "does not percent-decode headers from application config" do
+      Application.put_env(:otel_metric_exporter, :otlp_headers, %{"key" => "one%2Ctwo+three"})
+
+      assert {:ok, %{otlp_headers: %{"key" => "one%2Ctwo+three"}}} =
+               OtelMetricExporter.OtelApi.Config.defaults()
     end
 
     test "can be set by application config that overrides env vars" do

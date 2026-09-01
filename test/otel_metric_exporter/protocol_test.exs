@@ -2,6 +2,7 @@ defmodule OtelMetricExporter.ProtocolTest do
   use ExUnit.Case, async: true
 
   alias OtelMetricExporter.Protocol
+  alias OtelMetricExporter.OtlpUtils
 
   @config %{
     metadata: [:request_id, :stack_id, :span_id],
@@ -27,6 +28,14 @@ defmodule OtelMetricExporter.ProtocolTest do
         |> IO.iodata_to_binary()
 
       assert is_binary(msg)
+    end
+  end
+
+  describe "OTLP attribute values" do
+    test "encodes booleans as boolean values and atoms as strings" do
+      assert {:bool_value, true} = OtlpUtils.to_kv_value(true)
+      assert {:bool_value, false} = OtlpUtils.to_kv_value(false)
+      assert {:string_value, "normal"} = OtlpUtils.to_kv_value(:normal)
     end
   end
 end

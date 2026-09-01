@@ -16,6 +16,12 @@ defmodule OtelMetricExporter.OtelApi.Config do
   @type protocol :: :http_protobuf
   @type compression :: :gzip | nil
   @type endpoint_kind :: :generic | :signal
+  @typep header_parse_error ::
+           :malformed_member
+           | :unsupported_properties
+           | :invalid_key
+           | :invalid_percent_encoding
+           | :invalid_value
 
   endpoint_opt = [
     otlp_endpoint: [
@@ -134,16 +140,22 @@ defmodule OtelMetricExporter.OtelApi.Config do
   end
 
   defp put_from_env(acc, env_var, key, cast_fun \\ fn x -> {:ok, x} end) do
-    with {:ok, value} <- System.fetch_env(env_var),
-         {:ok, casted} <- cast_fun.(value) do
-      put_in(acc, List.wrap(key), casted)
-    else
+    case System.fetch_env(env_var) do
       :error ->
         acc
 
-      {:error, message} ->
-        Logger.warning("Invalid #{env_var} value, ignoring: #{message}")
+      {:ok, ""} ->
         acc
+
+      {:ok, value} ->
+        case cast_fun.(value) do
+          {:ok, casted} ->
+            put_in(acc, List.wrap(key), casted)
+
+          {:error, message} ->
+            Logger.warning("Invalid #{env_var} value, ignoring: #{message}")
+            acc
+        end
     end
   end
 
@@ -152,14 +164,138 @@ defmodule OtelMetricExporter.OtelApi.Config do
   defp cast_otlp_protocol("grpc"), do: {:ok, :grpc}
   defp cast_otlp_protocol(other), do: {:error, "invalid OTLP protocol: #{inspect(other)}"}
 
+  @spec cast_otlp_headers(String.t()) ::
+          {:ok, %{String.t() => String.t()}} | {:error, header_parse_error()}
   defp cast_otlp_headers(value) do
-    {:ok,
-     String.split(value, ",")
-     |> Enum.map(&String.split(&1, "="))
-     |> Map.new(fn [key, value] -> {key, value} end)}
-  rescue
-    FunctionClauseError ->
-      {:error, "invalid OTLP headers: #{inspect(value)}"}
+    value
+    |> String.split(",", trim: false)
+    |> Enum.reduce_while(%{}, fn member, headers ->
+      case parse_header_member(member) do
+        {:ok, {key, value}} -> {:cont, Map.put(headers, key, value)}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:error, reason} -> {:error, reason}
+      headers -> {:ok, headers}
+    end
+  end
+
+  @spec parse_header_member(String.t()) ::
+          {:ok, {String.t(), String.t()}} | {:error, header_parse_error()}
+  defp parse_header_member(member) do
+    member = trim_optional_whitespace(member)
+
+    cond do
+      member == "" -> {:error, :malformed_member}
+      :binary.match(member, ";") != :nomatch -> {:error, :unsupported_properties}
+      true -> split_header_member(member)
+    end
+  end
+
+  @spec split_header_member(String.t()) ::
+          {:ok, {String.t(), String.t()}} | {:error, header_parse_error()}
+  defp split_header_member(member) do
+    case :binary.match(member, "=") do
+      :nomatch ->
+        {:error, :malformed_member}
+
+      {separator, 1} ->
+        key = member |> binary_part(0, separator) |> trim_optional_whitespace()
+
+        value =
+          member
+          |> binary_part(separator + 1, byte_size(member) - separator - 1)
+          |> trim_optional_whitespace()
+
+        with true <- valid_http_token?(key),
+             {:ok, value} <- decode_header_value(value) do
+          {:ok, {key, value}}
+        else
+          false -> {:error, :invalid_key}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  @spec decode_header_value(String.t()) :: {:ok, String.t()} | {:error, header_parse_error()}
+  defp decode_header_value(value) do
+    with {:ok, decoded} <- percent_decode(value, []),
+         true <- valid_header_value_bytes?(decoded) do
+      {:ok, decoded}
+    else
+      {:error, reason} -> {:error, reason}
+      false -> {:error, :invalid_value}
+    end
+  end
+
+  @spec percent_decode(binary(), [binary()]) ::
+          {:ok, binary()} | {:error, :invalid_percent_encoding}
+  defp percent_decode(<<>>, acc), do: {:ok, IO.iodata_to_binary(Enum.reverse(acc))}
+
+  defp percent_decode(<<"%", high, low, rest::binary>>, acc) do
+    with {:ok, high} <- hex_digit(high),
+         {:ok, low} <- hex_digit(low) do
+      percent_decode(rest, [<<high * 16 + low>> | acc])
+    else
+      :error -> {:error, :invalid_percent_encoding}
+    end
+  end
+
+  defp percent_decode(<<"%", _rest::binary>>, _acc), do: {:error, :invalid_percent_encoding}
+  defp percent_decode(<<byte, rest::binary>>, acc), do: percent_decode(rest, [<<byte>> | acc])
+
+  @spec hex_digit(byte()) :: {:ok, 0..15} | :error
+  defp hex_digit(char) when char in ?0..?9, do: {:ok, char - ?0}
+  defp hex_digit(char) when char in ?A..?F, do: {:ok, char - ?A + 10}
+  defp hex_digit(char) when char in ?a..?f, do: {:ok, char - ?a + 10}
+  defp hex_digit(_char), do: :error
+
+  @spec valid_header_value_bytes?(binary()) :: boolean()
+  defp valid_header_value_bytes?(<<>>), do: true
+
+  defp valid_header_value_bytes?(<<byte, rest::binary>>)
+       when byte == 9 or byte in 0x20..0x7E,
+       do: valid_header_value_bytes?(rest)
+
+  defp valid_header_value_bytes?(_value), do: false
+
+  @spec valid_http_token?(binary()) :: boolean()
+  defp valid_http_token?(<<first, rest::binary>>) do
+    http_token_char?(first) and valid_http_token_bytes?(rest)
+  end
+
+  defp valid_http_token?(_), do: false
+
+  @spec valid_http_token_bytes?(binary()) :: boolean()
+  defp valid_http_token_bytes?(<<>>), do: true
+
+  defp valid_http_token_bytes?(<<char, rest::binary>>),
+    do: http_token_char?(char) and valid_http_token_bytes?(rest)
+
+  @spec http_token_char?(byte()) :: boolean()
+  defp http_token_char?(char)
+       when char in ?A..?Z or char in ?a..?z or char in ?0..?9 or
+              char in [?!, ?#, ?$, ?%, ?&, ?', ?*, ?+, ?-, ?., ?^, ?_, ?`, ?|, ?~],
+       do: true
+
+  defp http_token_char?(_char), do: false
+
+  @spec trim_optional_whitespace(binary()) :: binary()
+  defp trim_optional_whitespace(<<" ", rest::binary>>), do: trim_optional_whitespace(rest)
+  defp trim_optional_whitespace(<<"\t", rest::binary>>), do: trim_optional_whitespace(rest)
+
+  defp trim_optional_whitespace(value), do: trim_optional_whitespace_right(value)
+
+  @spec trim_optional_whitespace_right(binary()) :: binary()
+  defp trim_optional_whitespace_right(<<>>), do: <<>>
+
+  defp trim_optional_whitespace_right(value) do
+    case :binary.last(value) do
+      ?\s -> trim_optional_whitespace_right(binary_part(value, 0, byte_size(value) - 1))
+      ?\t -> trim_optional_whitespace_right(binary_part(value, 0, byte_size(value) - 1))
+      _ -> value
+    end
   end
 
   defp cast_otlp_timeout(value) do
