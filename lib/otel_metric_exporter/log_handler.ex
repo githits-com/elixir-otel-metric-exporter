@@ -41,8 +41,6 @@ defmodule OtelMetricExporter.LogHandler do
   alias OtelMetricExporter.LogAccumulator
   alias OtelMetricExporter.LogHandlerSupervisor
 
-  require Logger
-
   @behaviour :logger_handler
 
   @olp_config_keys [
@@ -117,6 +115,7 @@ defmodule OtelMetricExporter.LogHandler do
     with {:ok, olp_config} <- prevalidate_olp(olp_config),
          {:ok, acc_config} <-
            LogAccumulator.check_config(accumulator_config_to_validate, reg_name(old_config)),
+         :ok <- ensure_otlp_timeout_unchanged(old_handler_config, acc_config),
          :ok <- :logger_olp.set_opts(olp, olp_config) do
       :logger_olp.call(olp, {:config_changed, acc_config})
       olp_opts = :logger_olp.get_opts(olp)
@@ -139,9 +138,33 @@ defmodule OtelMetricExporter.LogHandler do
   @impl true
   def removing_handler(handler_config) do
     case Process.whereis(reg_name(handler_config)) do
-      nil -> :ok
-      _ -> :logger_olp.stop(get_in(handler_config, [:config, :olp]))
+      nil ->
+        :ok
+
+      _ ->
+        config = handler_config.config
+        olp = config.olp
+
+        :gen_server.stop(
+          :logger_olp.get_pid(olp),
+          :normal,
+          LogHandlerSupervisor.shutdown_timeout(config)
+        )
     end
+  end
+
+  defp ensure_otlp_timeout_unchanged(
+         %{api: %{config: %{otlp_timeout: timeout}}},
+         %{api: %{config: %{otlp_timeout: timeout}}}
+       ),
+       do: :ok
+
+  defp ensure_otlp_timeout_unchanged(
+         %{api: %{config: %{otlp_timeout: current_timeout}}},
+         %{api: %{config: %{otlp_timeout: requested_timeout}}}
+       ) do
+    # Supervisor/OLP shutdown allowances are captured at handler startup.
+    {:error, {:unsupported_live_otlp_timeout_change, current_timeout, requested_timeout}}
   end
 
   defp reg_name(%{module: module, id: id}), do: :"#{module}_#{id}"

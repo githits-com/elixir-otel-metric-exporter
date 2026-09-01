@@ -1,6 +1,28 @@
 defmodule OtelMetricExporter.LogHandlerSupervisor do
   @moduledoc false
-  use Supervisor, shutdown: 10_000, restart: :temporary
+  use Supervisor, restart: :temporary
+
+  alias OtelMetricExporter.OtelApi
+
+  @otp_cleanup_grace 1_000
+
+  @type accumulator_config :: %{
+          required(:api) => %OtelApi{
+            config: %OtelMetricExporter.OtelApi.Config{
+              otlp_timeout: pos_integer()
+            }
+          },
+          optional(atom()) => term()
+        }
+
+  @doc """
+  Returns the OTP stop/child allowance: the configured OTLP export timeout plus
+  fixed cleanup grace. The grace applies only to OTP termination and does not
+  enlarge the export deadline.
+  """
+  @spec shutdown_timeout(accumulator_config()) :: pos_integer()
+  def shutdown_timeout(%{api: %{config: %{otlp_timeout: timeout}}}),
+    do: timeout + @otp_cleanup_grace
 
   def fill_accumulator_config(accumulator_config, base_name) do
     accumulator_config
@@ -33,6 +55,15 @@ defmodule OtelMetricExporter.LogHandlerSupervisor do
     end
   end
 
+  @spec child_spec(map() | keyword()) :: Supervisor.child_spec()
+  def child_spec(args) do
+    args_map = Map.new(args)
+
+    super(args_map)
+    |> Map.put(:start, {__MODULE__, :start_link, [args]})
+    |> Map.put(:shutdown, shutdown_timeout(args_map.accumulator_config) + @otp_cleanup_grace)
+  end
+
   defp logger_olp_child_spec(reg_name, accumulator_config, olp_config) do
     %{
       id: :logger_olp,
@@ -46,7 +77,7 @@ defmodule OtelMetricExporter.LogHandlerSupervisor do
          ]},
       restart: :temporary,
       significant: true,
-      shutdown: 2000,
+      shutdown: shutdown_timeout(accumulator_config),
       type: :worker,
       modules: [OtelMetricExporter.LogAccumulator]
     }

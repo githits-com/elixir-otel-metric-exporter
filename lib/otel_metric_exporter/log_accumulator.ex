@@ -1,6 +1,5 @@
 defmodule OtelMetricExporter.LogAccumulator do
   @moduledoc false
-  require Logger
   alias OtelMetricExporter.Opentelemetry.Proto.Logs.V1.LogRecord
   alias OtelMetricExporter.OtelApi
   # This module is used as a callback for the logger_olp module.
@@ -121,14 +120,8 @@ defmodule OtelMetricExporter.LogAccumulator do
     end
   end
 
-  def handle_info({ref, result}, state)
+  def handle_info({ref, _result}, state)
       when is_map_key(state.pending_tasks, ref) do
-    if match?({:error, _}, result) do
-      Logger.debug(
-        "Error sending logs to #{state.api.config.otlp_endpoint}: #{inspect(elem(result, 1))}"
-      )
-    end
-
     {:noreply, complete_task(state, ref)}
   end
 
@@ -137,21 +130,13 @@ defmodule OtelMetricExporter.LogAccumulator do
     {:noreply, complete_task(state, ref)}
   end
 
-  # Catch-all for unexpected messages. Without this, the process would crash on
-  # any stray message (e.g. a late task reply after the task ref was forgotten,
-  # or monitor/EXIT signals from unrelated processes), which would take down the
-  # logger handler. Log and carry on instead.
-  def handle_info(msg, state) do
-    Logger.debug(fn ->
-      "#{inspect(__MODULE__)} received unexpected message: #{inspect(msg)}"
-    end)
-
-    {:noreply, state}
-  end
+  # Ignore stray messages without feeding diagnostics back into this logger handler.
+  def handle_info(_msg, state), do: {:noreply, state}
 
   def terminate(_reason, state) do
-    # Send any remaining logs if possible
-    send_events_via_task(state)
+    deadline = OtelApi.new_deadline(state.api)
+    shutdown(state, deadline)
+    :ok
   end
 
   # We don't care about event order# If we have a here, because it's all timestamped
@@ -201,6 +186,8 @@ defmodule OtelMetricExporter.LogAccumulator do
     %{state | pending_tasks: Map.delete(pending_tasks, ref)}
   end
 
+  # Normal exports create their deadline inside the task so scheduler delay does not consume
+  # the budget; shutdown passes the deadline created before dispatch.
   defp send_events_via_task(%{api: api, event_queue: queue} = state) do
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, OtelApi, :send_log_events, [
@@ -212,7 +199,80 @@ defmodule OtelMetricExporter.LogAccumulator do
       state
       | event_queue: [],
         queue_len: 0,
-        pending_tasks: Map.put(state.pending_tasks, task.ref, :pending)
+        pending_tasks: Map.put(state.pending_tasks, task.ref, task)
     }
+  end
+
+  defp send_events_via_task(%{api: api, event_queue: queue} = state, deadline) do
+    task =
+      Task.Supervisor.async_nolink(state.task_supervisor, OtelApi, :send_log_events, [
+        api,
+        queue,
+        deadline
+      ])
+
+    %{
+      state
+      | event_queue: [],
+        queue_len: 0,
+        pending_tasks: Map.put(state.pending_tasks, task.ref, task)
+    }
+  end
+
+  defp shutdown(state, deadline) do
+    case OtelApi.remaining_timeout(deadline) do
+      :expired ->
+        terminate_pending_tasks(state.pending_tasks)
+
+      _remaining ->
+        cond do
+          state.event_queue == [] and map_size(state.pending_tasks) == 0 ->
+            :ok
+
+          state.event_queue != [] and
+              map_size(state.pending_tasks) < state.api.config.otlp_concurrent_requests ->
+            shutdown(send_events_via_task(state, deadline), deadline)
+
+          true ->
+            shutdown(await_task(state, deadline), deadline)
+        end
+    end
+  end
+
+  defp await_task(%{pending_tasks: pending_tasks} = state, deadline) do
+    case OtelApi.remaining_timeout(deadline) do
+      timeout when is_integer(timeout) ->
+        receive do
+          {ref, _result} when is_map_key(pending_tasks, ref) ->
+            complete_task(state, ref)
+
+          {:DOWN, ref, :process, _, _} when is_map_key(pending_tasks, ref) ->
+            complete_task(state, ref)
+        after
+          timeout ->
+            terminate_pending_tasks(pending_tasks)
+            %{state | pending_tasks: %{}}
+        end
+
+      :expired ->
+        terminate_pending_tasks(pending_tasks)
+        %{state | pending_tasks: %{}}
+    end
+  end
+
+  defp terminate_pending_tasks(pending_tasks) do
+    Enum.each(pending_tasks, fn {ref, %Task{pid: pid}} ->
+      Process.exit(pid, :kill)
+      Process.demonitor(ref, [:flush])
+      flush_task_result(ref)
+    end)
+  end
+
+  defp flush_task_result(ref) do
+    receive do
+      {^ref, _result} -> flush_task_result(ref)
+    after
+      0 -> :ok
+    end
   end
 end

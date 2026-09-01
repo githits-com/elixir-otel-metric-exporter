@@ -33,7 +33,8 @@ defmodule OtelMetricExporter.LogAccumulatorTest do
         end)
 
       ref = Process.monitor(task_pid)
-      state = %{pending_tasks: %{ref => :pending}}
+      task = %Task{mfa: {__MODULE__, :test, []}, owner: self(), pid: task_pid, ref: ref}
+      state = %{pending_tasks: %{ref => task}}
 
       assert_receive :task_ready
       on_exit(fn -> send(task_pid, :stop) end)
@@ -50,7 +51,8 @@ defmodule OtelMetricExporter.LogAccumulatorTest do
 
     test "removes a known task after a DOWN message" do
       ref = make_ref()
-      state = %{pending_tasks: %{ref => :pending}}
+      task = %Task{mfa: {__MODULE__, :test, []}, owner: self(), pid: self(), ref: ref}
+      state = %{pending_tasks: %{ref => task}}
 
       assert {:noreply, %{pending_tasks: %{}}} =
                LogAccumulator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
