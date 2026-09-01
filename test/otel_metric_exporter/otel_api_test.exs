@@ -7,6 +7,8 @@ defmodule OtelMetricExporter.OtelApiTest do
     on_exit(fn ->
       System.delete_env("OTEL_SERVICE_NAME")
       System.delete_env("OTEL_RESOURCE_ATTRIBUTES")
+      Application.delete_env(:otel_metric_exporter, :logs)
+      Application.delete_env(:otel_metric_exporter, :metrics)
     end)
   end
 
@@ -97,6 +99,109 @@ defmodule OtelMetricExporter.OtelApiTest do
                  %{finch: self(), otlp_endpoint: "http://localhost:4317"},
                  :logs
                )
+    end
+  end
+
+  describe "OTLP endpoint paths" do
+    test "appends the signal path to a generic endpoint" do
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}"
+      {:ok, _} = start_supervised({Finch, name: EndpointFinch})
+
+      Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(%{finch: EndpointFinch, otlp_endpoint: endpoint, retry: false}, :logs)
+
+      assert :ok = OtelApi.send_log_events(api, [])
+    end
+
+    test "appends the signal path to a generic prefix without duplicating its separator" do
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}/collector/?tenant=pkgseer#fragment"
+      {:ok, _} = start_supervised({Finch, name: PrefixEndpointFinch})
+
+      Bypass.expect_once(bypass, "POST", "/collector/v1/logs", fn conn ->
+        assert conn.query_string == "tenant=pkgseer"
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(
+                 %{finch: PrefixEndpointFinch, otlp_endpoint: endpoint, retry: false},
+                 :logs
+               )
+
+      assert :ok = OtelApi.send_log_events(api, [])
+    end
+
+    test "appends the metrics path to a generic endpoint" do
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}"
+      {:ok, _} = start_supervised({Finch, name: MetricsEndpointFinch})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(
+                 %{finch: MetricsEndpointFinch, otlp_endpoint: endpoint, retry: false},
+                 :metrics
+               )
+
+      assert :ok = OtelApi.send_metrics(api, [])
+    end
+
+    test "uses signal-specific logs and metrics endpoints unchanged" do
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}"
+      {:ok, _} = start_supervised({Finch, name: SignalEndpointFinch})
+
+      Application.put_env(:otel_metric_exporter, :logs, otlp_endpoint: endpoint <> "/custom/logs")
+
+      Application.put_env(:otel_metric_exporter, :metrics,
+        otlp_endpoint: endpoint <> "/custom/metrics"
+      )
+
+      Bypass.expect_once(bypass, "POST", "/custom/logs", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      Bypass.expect_once(bypass, "POST", "/custom/metrics", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      assert {:ok, logs_api, %{}} =
+               OtelApi.new(%{finch: SignalEndpointFinch, retry: false}, :logs)
+
+      assert {:ok, metrics_api, %{}} =
+               OtelApi.new(%{finch: SignalEndpointFinch, retry: false}, :metrics)
+
+      assert :ok = OtelApi.send_log_events(logs_api, [])
+      assert :ok = OtelApi.send_metrics(metrics_api, [])
+    end
+
+    test "treats a direct endpoint override as generic" do
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}"
+      {:ok, _} = start_supervised({Finch, name: OverrideEndpointFinch})
+
+      Application.put_env(:otel_metric_exporter, :logs, otlp_endpoint: endpoint <> "/custom/logs")
+
+      Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(
+                 %{finch: OverrideEndpointFinch, otlp_endpoint: endpoint, retry: false},
+                 :logs
+               )
+
+      assert :ok = OtelApi.send_log_events(api, [])
     end
   end
 

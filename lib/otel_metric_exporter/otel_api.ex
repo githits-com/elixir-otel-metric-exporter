@@ -254,7 +254,22 @@ defmodule OtelMetricExporter.OtelApi do
 
   defp timeout_error, do: {:error, %Mint.TransportError{reason: :timeout}}
 
-  defp url(%__MODULE__{config: config}, path), do: config.otlp_endpoint <> path
+  @spec url(%__MODULE__{}, String.t()) :: String.t()
+  defp url(
+         %__MODULE__{
+           config: %Config{otlp_endpoint: endpoint, otlp_endpoint_kind: :signal}
+         },
+         _path
+       ),
+       do: endpoint
+
+  defp url(
+         %__MODULE__{
+           config: %Config{otlp_endpoint: endpoint, otlp_endpoint_kind: :generic}
+         },
+         path
+       ),
+       do: endpoint |> URI.parse() |> URI.append_path(path) |> URI.to_string()
 
   defp headers(%__MODULE__{config: %Config{otlp_compression: compression} = config}) do
     [:content_type, :accept, :compression]

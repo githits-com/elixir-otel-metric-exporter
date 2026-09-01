@@ -104,6 +104,50 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
   end
 
   describe "validate_for_scope/2" do
+    test "marks a direct endpoint as generic" do
+      assert {:ok, %OtelMetricExporter.OtelApi.Config{otlp_endpoint_kind: :generic}, %{}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                 %{otlp_endpoint: "http://localhost:4318"},
+                 :logs
+               )
+    end
+
+    test "marks an environment signal endpoint as signal-specific" do
+      System.put_env("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://localhost:4318/logs")
+
+      assert {:ok, %OtelMetricExporter.OtelApi.Config{otlp_endpoint_kind: :signal}, %{}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(%{}, :logs)
+    end
+
+    test "marks an application signal endpoint as signal-specific" do
+      Application.put_env(:otel_metric_exporter, :metrics,
+        otlp_endpoint: "http://localhost:4318/metrics"
+      )
+
+      assert {:ok, %OtelMetricExporter.OtelApi.Config{otlp_endpoint_kind: :signal}, %{}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(%{}, :metrics)
+    end
+
+    test "marks a direct endpoint override as generic" do
+      Application.put_env(:otel_metric_exporter, :logs,
+        otlp_endpoint: "http://localhost:4318/logs"
+      )
+
+      assert {:ok, %OtelMetricExporter.OtelApi.Config{otlp_endpoint_kind: :generic}, %{}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                 %{otlp_endpoint: "http://localhost:4318"},
+                 :logs
+               )
+    end
+
+    test "continues ignoring direct nested signal options" do
+      assert {:error, %{key: :otlp_endpoint}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                 %{logs: %{otlp_endpoint: "http://localhost:4318/logs"}},
+                 :logs
+               )
+    end
+
     test "returns error if otlp endpoint is not provided" do
       assert {:error, %{key: :otlp_endpoint}} =
                OtelMetricExporter.OtelApi.Config.validate_for_scope(

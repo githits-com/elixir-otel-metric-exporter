@@ -3,6 +3,7 @@ defmodule OtelMetricExporter.OtelApi.Config do
 
   defstruct [
     :otlp_endpoint,
+    :otlp_endpoint_kind,
     :otlp_protocol,
     :otlp_headers,
     :otlp_timeout,
@@ -14,6 +15,7 @@ defmodule OtelMetricExporter.OtelApi.Config do
 
   @type protocol :: :http_protobuf
   @type compression :: :gzip | nil
+  @type endpoint_kind :: :generic | :signal
 
   endpoint_opt = [
     otlp_endpoint: [
@@ -205,10 +207,14 @@ defmodule OtelMetricExporter.OtelApi.Config do
     |> NimbleOptions.validate(options_schema())
   end
 
+  @spec validate_for_scope(map(), :logs | :metrics) ::
+          {:ok, %__MODULE__{}, map()} | {:error, NimbleOptions.ValidationError.t()}
   def validate_for_scope(config, scope) when scope in [:logs, :metrics] do
     {provided, rest} = Map.split(config, Keyword.keys(@public_options) -- [:logs, :metrics])
 
     with {:ok, defaults} <- defaults() do
+      endpoint_kind = endpoint_kind(provided, defaults, scope)
+
       with_overrides =
         defaults
         |> get_for_scope(scope)
@@ -220,12 +226,22 @@ defmodule OtelMetricExporter.OtelApi.Config do
       case Map.get(with_overrides, :exporter) do
         x when x in [:otlp, nil] ->
           with {:ok, validated} <- NimbleOptions.validate(with_overrides, @single_scope_schema) do
-            {:ok, struct!(__MODULE__, validated), rest}
+            {:ok, struct!(__MODULE__, Map.put(validated, :otlp_endpoint_kind, endpoint_kind)),
+             rest}
           end
 
         :none ->
-          {:ok, %__MODULE__{exporter: :none}, rest}
+          {:ok, %__MODULE__{exporter: :none, otlp_endpoint_kind: endpoint_kind}, rest}
       end
+    end
+  end
+
+  @spec endpoint_kind(map(), map(), :logs | :metrics) :: endpoint_kind()
+  defp endpoint_kind(provided, defaults, scope) do
+    cond do
+      Map.has_key?(provided, :otlp_endpoint) -> :generic
+      Map.has_key?(Map.get(defaults, scope, %{}), :otlp_endpoint) -> :signal
+      true -> :generic
     end
   end
 
