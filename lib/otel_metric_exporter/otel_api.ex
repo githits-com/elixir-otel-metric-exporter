@@ -12,9 +12,9 @@ defmodule OtelMetricExporter.OtelApi do
 
   @schema NimbleOptions.new!(
             finch: [
-              type: {:or, [:atom, :pid]},
+              type: :atom,
               required: true,
-              doc: "Finch process pid or registered name to use for sending requests."
+              doc: "Registered Finch process name to use for sending requests."
             ],
             retry: [
               type: :boolean,

@@ -66,9 +66,9 @@ defmodule OtelMetricExporter.OtelApi.Config do
       doc: "Compression to use for OTLP requests. Allowed values are `:gzip` and `nil`."
     ],
     otlp_concurrent_requests: [
-      type: :non_neg_integer,
+      type: :pos_integer,
       default: 10,
-      doc: "Number of concurrent requests to send to the OTLP endpoint."
+      doc: "Number of concurrent requests to send to the OTLP endpoint. Must be positive."
     ],
     resource: [
       type: {:map, {:or, [:atom, :string]}, :any},

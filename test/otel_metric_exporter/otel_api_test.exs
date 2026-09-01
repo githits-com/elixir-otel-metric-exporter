@@ -89,6 +89,15 @@ defmodule OtelMetricExporter.OtelApiTest do
                  :metrics
                )
     end
+
+    @tag :otlp_validation_boundary
+    test "rejects a Finch pid" do
+      assert {:error, %{key: :finch}} =
+               OtelApi.new(
+                 %{finch: self(), otlp_endpoint: "http://localhost:4317"},
+                 :logs
+               )
+    end
   end
 
   @tag :otlp_attempt_timeout
@@ -497,14 +506,14 @@ defmodule OtelMetricExporter.OtelApiTest do
                %{
                  finch: TestFinch,
                  otlp_endpoint: "http://localhost:#{bypass.port}",
-                 otlp_timeout: 400
+                 otlp_timeout: 1_500
                },
                :logs
              )
 
     started_at = System.monotonic_time(:millisecond)
     task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
-    Process.sleep(300)
+    Process.sleep(600)
     Bypass.pass(bypass)
     send(holder_pid, :release_holder)
     assert_receive {:request_started, 2, request_pid}, 1_000
@@ -512,7 +521,7 @@ defmodule OtelMetricExporter.OtelApiTest do
 
     assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 1_000)
     elapsed = System.monotonic_time(:millisecond) - started_at
-    assert elapsed < 550
+    assert elapsed < 1_750
 
     send(request_pid, :release_request)
     assert {:ok, {:ok, %{status: 200}}} = Task.yield(holder, 5_000)

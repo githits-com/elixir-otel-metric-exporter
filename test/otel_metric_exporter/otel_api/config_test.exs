@@ -143,5 +143,14 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
                  :logs
                )
     end
+
+    @tag :otlp_validation_boundary
+    test "rejects zero concurrent requests" do
+      assert {:error, %{key: :otlp_concurrent_requests}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                 %{otlp_endpoint: "http://localhost:4317", otlp_concurrent_requests: 0},
+                 :logs
+               )
+    end
   end
 end
