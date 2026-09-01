@@ -56,7 +56,7 @@ defmodule OtelMetricExporter.OtelApi do
     body
     |> encode_to_iodata()
     |> build_finch_request(path, api)
-    |> make_finch_request(api.finch, with_retry?: api.retry)
+    |> make_finch_request(api.finch, api.config.otlp_timeout, with_retry?: api.retry)
   end
 
   def encode_to_iodata(body) do
@@ -82,9 +82,9 @@ defmodule OtelMetricExporter.OtelApi do
     )
   end
 
-  defp make_finch_request(request, finch_pool, with_retry?: true) do
+  defp make_finch_request(request, finch_pool, receive_timeout, with_retry?: true) do
     retry with: exponential_backoff(1_000) |> randomize() |> expiry(20_000), atoms: [:retry] do
-      case finch_request(request, finch_pool) do
+      case finch_request(request, finch_pool, receive_timeout) do
         :ok ->
           :ok
 
@@ -114,13 +114,13 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
-  defp make_finch_request(request, finch_pool, with_retry?: false) do
-    finch_request(request, finch_pool)
+  defp make_finch_request(request, finch_pool, receive_timeout, with_retry?: false) do
+    finch_request(request, finch_pool, receive_timeout)
   end
 
-  defp finch_request(request, finch_pool) do
+  defp finch_request(request, finch_pool, receive_timeout) do
     request
-    |> Finch.request(finch_pool)
+    |> Finch.request(finch_pool, receive_timeout: receive_timeout)
     |> case do
       {:ok, %{status: 200}} ->
         :ok

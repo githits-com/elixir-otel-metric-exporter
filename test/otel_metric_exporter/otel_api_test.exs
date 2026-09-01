@@ -90,4 +90,38 @@ defmodule OtelMetricExporter.OtelApiTest do
                )
     end
   end
+
+  @tag :otlp_attempt_timeout
+  test "uses the configured timeout for a blocked receiver" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: TestFinch})
+    parent = self()
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      send(parent, {:request_received, self()})
+
+      receive do
+        :release -> Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: TestFinch,
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 otlp_timeout: 100,
+                 retry: false
+               },
+               :logs
+             )
+
+    task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
+    assert_receive {:request_received, request_pid}, 1_000
+    on_exit(fn -> send(request_pid, :release) end)
+    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 1_000)
+
+    Bypass.pass(bypass)
+    send(request_pid, :release)
+  end
 end
