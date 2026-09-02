@@ -13,12 +13,27 @@ defmodule OtelMetricExporter.MetricStoreTest do
   alias OtelMetricExporter.MetricStore
 
   @name :metric_store_test
+  @event [:otel_metric_exporter, :export, :stop]
   @default_buckets [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
   @response_cap 4_194_304
 
   setup do
     bypass = Bypass.open()
     {:ok, _} = start_supervised({Finch, name: TestFinch})
+
+    handler_id = {__MODULE__, make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      @event,
+      fn event, measurements, metadata, _config ->
+        send(parent, {:export_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     config = %{
       otlp_protocol: :http_protobuf,
@@ -112,6 +127,118 @@ defmodule OtelMetricExporter.MetricStoreTest do
   end
 
   describe "export flow" do
+    test "emits one success event with OTLP data-point count", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      sum = Metrics.sum("test.sum")
+      gauge = Metrics.last_value("test.gauge")
+      histogram = Metrics.distribution("test.histogram")
+
+      start_supervised!(
+        {MetricStore, %{config | metrics: [sum, gauge, histogram], export_period: 60_000}}
+      )
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 200, "")
+      end)
+
+      MetricStore.write_metric(@name, sum, 1, %{tag: "one"})
+      MetricStore.write_metric(@name, sum, 2, %{tag: "two"})
+      MetricStore.write_metric(@name, gauge, 3, %{tag: "one"})
+      MetricStore.write_metric(@name, histogram, 4, %{tag: "one"})
+
+      assert :ok = MetricStore.export_sync(@name)
+      assert_receive {:export_event, @event, measurements, %{scope: :metrics, outcome: :success}}
+      assert measurements.batch_size == 4
+      assert measurements.rejected_items == 0
+      assert measurements.dropped_items == 0
+      assert measurements.duration_ms >= 0
+    end
+
+    test "emits partial rejection count without duplicating it as dropped points", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        response = %ExportMetricsServiceResponse{
+          partial_success: %ExportMetricsPartialSuccess{rejected_data_points: 1}
+        }
+
+        Plug.Conn.resp(conn, 200, IO.iodata_to_binary(Protobuf.encode_to_iodata(response)))
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, %{tag: "one"})
+      MetricStore.write_metric(@name, metric, 2, %{tag: "two"})
+
+      assert {:partial_success, 1} = MetricStore.export_sync(@name)
+
+      assert_receive {:export_event, @event, measurements,
+                      %{scope: :metrics, outcome: :partial_success}}
+
+      assert measurements.batch_size == 2
+      assert measurements.rejected_items == 1
+      assert measurements.dropped_items == 0
+      assert MetricStore.get_metrics(@name, 0) == %{}
+    end
+
+    test "emits terminal drop count for all converted data points", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.last_value("test.gauge")
+      start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 500, "Internal Server Error")
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, %{tag: "one"})
+      MetricStore.write_metric(@name, metric, 2, %{tag: "two"})
+
+      capture_log(fn ->
+        assert {:error, :terminal, {:http_status, 500}} = MetricStore.export_sync(@name)
+      end)
+
+      assert_receive {:export_event, @event, measurements,
+                      %{scope: :metrics, outcome: :terminal_http_status}}
+
+      assert measurements.batch_size == 2
+      assert measurements.rejected_items == 0
+      assert measurements.dropped_items == 2
+      assert MetricStore.get_metrics(@name, 0) == %{}
+    end
+
+    test "emits retryable outcome without dropping retained data points", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.distribution("test.histogram")
+      start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 503, "Service Unavailable")
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, %{tag: "one"})
+      MetricStore.write_metric(@name, metric, 2, %{tag: "two"})
+
+      capture_log(fn ->
+        assert {:error, :retryable, {:http_status, 503}} = MetricStore.export_sync(@name)
+      end)
+
+      assert_receive {:export_event, @event, measurements,
+                      %{scope: :metrics, outcome: :retryable_http_status}}
+
+      assert measurements.batch_size == 2
+      assert measurements.rejected_items == 0
+      assert measurements.dropped_items == 0
+      assert MetricStore.get_metrics(@name, 0) != %{}
+    end
+
     test "exports all metrics in protobuf format", %{bypass: bypass, store_config: config} do
       metrics =
         [metric1, metric2, metric_lv_int, metric_lv_bigint, metric_lv_float, metric4] =

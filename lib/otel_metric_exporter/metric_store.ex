@@ -17,6 +17,7 @@ defmodule OtelMetricExporter.MetricStore do
   }
 
   alias OtelMetricExporter.OtelApi
+  alias OtelMetricExporter.ExportTelemetry
 
   import OtelMetricExporter.OtlpUtils, only: [build_kv: 1]
 
@@ -245,11 +246,17 @@ defmodule OtelMetricExporter.MetricStore do
     end)
     |> then(fn payload ->
       deadline = OtelApi.new_deadline(state.api)
+      batch_size = count_data_points(payload)
+      telemetry_start = ExportTelemetry.start()
 
       {worker_pid, monitor_ref, result_ref} =
         spawn_export_worker(state.api, payload, deadline)
 
-      await_export_task(result_ref, worker_pid, monitor_ref, deadline)
+      result = await_export_task(result_ref, worker_pid, monitor_ref, deadline)
+      dropped_items = if match?({:error, :terminal, _}, result), do: batch_size, else: 0
+
+      ExportTelemetry.stop(telemetry_start, :metrics, batch_size, result, dropped_items)
+      result
     end)
     |> case do
       :ok ->
@@ -269,6 +276,20 @@ defmodule OtelMetricExporter.MetricStore do
         log_export_failure(:retryable, reason)
         result
     end
+  end
+
+  @spec count_data_points(list(Metric.t())) :: non_neg_integer()
+  defp count_data_points(metrics) do
+    Enum.reduce(metrics, 0, fn
+      %Metric{data: {:sum, %Sum{data_points: data_points}}}, count ->
+        count + length(data_points)
+
+      %Metric{data: {:gauge, %Gauge{data_points: data_points}}}, count ->
+        count + length(data_points)
+
+      %Metric{data: {:histogram, %Histogram{data_points: data_points}}}, count ->
+        count + length(data_points)
+    end)
   end
 
   @spec spawn_export_worker(%OtelApi{}, list(), OtelApi.deadline()) ::

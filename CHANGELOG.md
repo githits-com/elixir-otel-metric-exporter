@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add bounded completion telemetry for log and metric export batches.
+
 ## [0.3.6] - 2025-04-08
 
 - Fix protobuf encoding of `:logger.report()` events

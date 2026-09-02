@@ -31,6 +31,20 @@ defmodule OtelMetricExporter.LogAccumulator do
 
   @behaviour GenServer
 
+  alias OtelMetricExporter.ExportTelemetry
+
+  defmodule PendingTask do
+    @moduledoc false
+
+    defstruct [:task, :batch_size, :telemetry_start]
+
+    @type t :: %__MODULE__{
+            task: Task.t(),
+            batch_size: non_neg_integer(),
+            telemetry_start: ExportTelemetry.start_time()
+          }
+  end
+
   @schema NimbleOptions.new!(
             metadata: [
               type: {:list, :atom},
@@ -85,6 +99,7 @@ defmodule OtelMetricExporter.LogAccumulator do
      Map.merge(config, %{
        event_queue: [],
        queue_len: 0,
+       queue_telemetry_start: nil,
        timer_ref: nil,
        pending_tasks: %{}
      })}
@@ -120,14 +135,14 @@ defmodule OtelMetricExporter.LogAccumulator do
     end
   end
 
-  def handle_info({ref, _result}, state)
+  def handle_info({ref, result}, state)
       when is_map_key(state.pending_tasks, ref) do
-    {:noreply, complete_task(state, ref)}
+    {:noreply, complete_task(state, ref, {:result, result})}
   end
 
   def handle_info({:DOWN, ref, :process, _, _}, state)
       when is_map_key(state.pending_tasks, ref) do
-    {:noreply, complete_task(state, ref)}
+    {:noreply, complete_task(state, ref, :exit)}
   end
 
   # Ignore stray messages without feeding diagnostics back into this logger handler.
@@ -142,8 +157,17 @@ defmodule OtelMetricExporter.LogAccumulator do
   # We don't care about event order# If we have a here, because it's all timestamped
   # and up to the log display to order
   defp add_event(%{event_queue: queue, queue_len: len} = state, event)
-       when is_struct(event, LogRecord),
-       do: %{state | event_queue: [event | queue], queue_len: len + 1}
+       when is_struct(event, LogRecord) do
+    state
+    |> Map.put(:event_queue, [event | queue])
+    |> Map.put(:queue_len, len + 1)
+    |> maybe_start_queue_telemetry(len)
+  end
+
+  defp maybe_start_queue_telemetry(state, 0),
+    do: Map.put(state, :queue_telemetry_start, ExportTelemetry.start())
+
+  defp maybe_start_queue_telemetry(state, _len), do: state
 
   # If we have the maximum number of concurrent requests, block
   defp send_schedule_or_block(%{pending_tasks: pending_tasks} = state)
@@ -173,22 +197,53 @@ defmodule OtelMetricExporter.LogAccumulator do
     # Block via a receive, waiting for a completion message or a down message
     # from a task that we started
     receive do
-      {ref, _result} when is_map_key(pending_tasks, ref) ->
-        complete_task(state, ref)
+      {ref, result} when is_map_key(pending_tasks, ref) ->
+        complete_task(state, ref, {:result, result})
 
       {:DOWN, ref, :process, _, _} when is_map_key(pending_tasks, ref) ->
-        complete_task(state, ref)
+        complete_task(state, ref, :exit)
     end
   end
 
-  defp complete_task(%{pending_tasks: pending_tasks} = state, ref) do
+  defp complete_task(%{pending_tasks: pending_tasks} = state, ref, completion) do
+    {pending_task, pending_tasks} = Map.pop!(pending_tasks, ref)
+
+    %PendingTask{
+      batch_size: batch_size,
+      telemetry_start: telemetry_start
+    } = pending_task
+
     Process.demonitor(ref, [:flush])
-    %{state | pending_tasks: Map.delete(pending_tasks, ref)}
+    {result, dropped_items} = final_log_result(completion, batch_size)
+    ExportTelemetry.stop(telemetry_start, :logs, batch_size, result, dropped_items)
+    %{state | pending_tasks: pending_tasks}
   end
+
+  @spec final_log_result(
+          {:result, OtelApi.export_result()} | :exit | :deadline,
+          non_neg_integer()
+        ) ::
+          {OtelApi.export_result(), non_neg_integer()}
+  defp final_log_result({:result, :ok}, _batch_size), do: {:ok, 0}
+
+  defp final_log_result({:result, {:partial_success, rejected_items}}, _batch_size),
+    do: {{:partial_success, rejected_items}, 0}
+
+  defp final_log_result({:result, {:error, disposition, reason}}, batch_size),
+    do: {{:error, disposition, reason}, batch_size}
+
+  defp final_log_result(:exit, batch_size),
+    do: {{:error, :retryable, :export_task_failed}, batch_size}
+
+  defp final_log_result(:deadline, batch_size),
+    do: {{:error, :retryable, :deadline_exceeded}, batch_size}
 
   # Normal exports create their deadline inside the task so scheduler delay does not consume
   # the budget; shutdown passes the deadline created before dispatch.
   defp send_events_via_task(%{api: api, event_queue: queue} = state) do
+    batch_size = state.queue_len
+    telemetry_start = ExportTelemetry.start()
+
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, OtelApi, :send_log_events, [
         api,
@@ -199,11 +254,24 @@ defmodule OtelMetricExporter.LogAccumulator do
       state
       | event_queue: [],
         queue_len: 0,
-        pending_tasks: Map.put(state.pending_tasks, task.ref, task)
+        queue_telemetry_start: nil,
+        pending_tasks:
+          Map.put(
+            state.pending_tasks,
+            task.ref,
+            %PendingTask{
+              task: task,
+              batch_size: batch_size,
+              telemetry_start: telemetry_start
+            }
+          )
     }
   end
 
   defp send_events_via_task(%{api: api, event_queue: queue} = state, deadline) do
+    batch_size = state.queue_len
+    telemetry_start = ExportTelemetry.start()
+
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, OtelApi, :send_log_events, [
         api,
@@ -215,14 +283,24 @@ defmodule OtelMetricExporter.LogAccumulator do
       state
       | event_queue: [],
         queue_len: 0,
-        pending_tasks: Map.put(state.pending_tasks, task.ref, task)
+        queue_telemetry_start: nil,
+        pending_tasks:
+          Map.put(
+            state.pending_tasks,
+            task.ref,
+            %PendingTask{
+              task: task,
+              batch_size: batch_size,
+              telemetry_start: telemetry_start
+            }
+          )
     }
   end
 
   defp shutdown(state, deadline) do
     case OtelApi.remaining_timeout(deadline) do
       :expired ->
-        terminate_pending_tasks(state.pending_tasks)
+        state |> terminate_pending_tasks() |> drop_queued_batch()
 
       _remaining ->
         cond do
@@ -243,36 +321,48 @@ defmodule OtelMetricExporter.LogAccumulator do
     case OtelApi.remaining_timeout(deadline) do
       timeout when is_integer(timeout) ->
         receive do
-          {ref, _result} when is_map_key(pending_tasks, ref) ->
-            complete_task(state, ref)
+          {ref, result} when is_map_key(pending_tasks, ref) ->
+            complete_task(state, ref, {:result, result})
 
           {:DOWN, ref, :process, _, _} when is_map_key(pending_tasks, ref) ->
-            complete_task(state, ref)
+            complete_task(state, ref, :exit)
         after
           timeout ->
-            terminate_pending_tasks(pending_tasks)
-            %{state | pending_tasks: %{}}
+            state |> terminate_pending_tasks() |> drop_queued_batch()
         end
 
       :expired ->
-        terminate_pending_tasks(pending_tasks)
-        %{state | pending_tasks: %{}}
+        state |> terminate_pending_tasks() |> drop_queued_batch()
     end
   end
 
-  defp terminate_pending_tasks(pending_tasks) do
-    Enum.each(pending_tasks, fn {ref, %Task{pid: pid}} ->
+  defp terminate_pending_tasks(%{pending_tasks: pending_tasks} = state) do
+    Enum.reduce(pending_tasks, state, fn {ref, %PendingTask{task: %Task{pid: pid}}}, state ->
       Process.exit(pid, :kill)
-      Process.demonitor(ref, [:flush])
-      flush_task_result(ref)
+
+      receive do
+        {^ref, result} ->
+          complete_task(state, ref, {:result, result})
+
+        {:DOWN, ^ref, :process, ^pid, _reason} ->
+          complete_task(state, ref, :deadline)
+      end
     end)
   end
 
-  defp flush_task_result(ref) do
-    receive do
-      {^ref, _result} -> flush_task_result(ref)
-    after
-      0 -> :ok
-    end
+  defp drop_queued_batch(%{queue_len: 0} = state), do: state
+
+  defp drop_queued_batch(state) do
+    telemetry_start = state.queue_telemetry_start
+
+    ExportTelemetry.stop(
+      telemetry_start,
+      :logs,
+      state.queue_len,
+      {:error, :retryable, :deadline_exceeded},
+      state.queue_len
+    )
+
+    %{state | event_queue: [], queue_len: 0, queue_telemetry_start: nil}
   end
 end

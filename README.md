@@ -27,3 +27,16 @@ end
 Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
 and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
 be found at <https://hexdocs.pm/otel_metric_exporter>.
+
+## Export completion telemetry
+
+The exporter emits one `[:otel_metric_exporter, :export, :stop]` event for each
+final log or metric batch outcome. Measurements are exactly
+`duration_ms`, `batch_size`, `rejected_items`, and `dropped_items`; all are
+non-negative integers. Metadata is exactly `scope` (`:logs` or `:metrics`) and
+the bounded `outcome` atom. No endpoint, headers, response content, or error
+terms are included.
+
+For logs, a final failure drops the full batch. For metrics, a terminal failure
+drops the full data-point batch, while a retryable failure retains it. Partial
+success reports rejected items separately and does not count them as dropped.
