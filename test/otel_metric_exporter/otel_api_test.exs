@@ -499,6 +499,125 @@ defmodule OtelMetricExporter.OtelApiTest do
     assert Agent.get(attempts, & &1) == 2
   end
 
+  @tag :otlp_retry_after
+  test "retries immediately for a zero Retry-After hint" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: RetryAfterFinch})
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      attempt = Agent.get_and_update(attempts, fn count -> {count + 1, count + 1} end)
+
+      case attempt do
+        1 ->
+          conn
+          |> Plug.Conn.put_resp_header("Retry-After", "0")
+          |> Plug.Conn.resp(503, "temporary")
+
+        2 ->
+          Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: RetryAfterFinch,
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 otlp_timeout: 500
+               },
+               :logs
+             )
+
+    assert :ok = OtelApi.send_log_events(api, [])
+    assert Agent.get(attempts, & &1) == 2
+  end
+
+  @tag :otlp_retry_after
+  test "does not sleep or retry when Retry-After reaches the remaining deadline" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: RetryAfterBudgetFinch})
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      Agent.update(attempts, &(&1 + 1))
+
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", "60")
+      |> Plug.Conn.resp(503, "temporary")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: RetryAfterBudgetFinch,
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 otlp_timeout: 3_000
+               },
+               :logs
+             )
+
+    assert {:error, :retryable, {:http_status, 503}} = OtelApi.send_log_events(api, [])
+    assert Agent.get(attempts, & &1) == 1
+  end
+
+  @tag :otlp_retry_after
+  test "retry false keeps the public result contract and makes one request" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: RetryAfterDisabledFinch})
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+      Agent.update(attempts, &(&1 + 1))
+
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", "0")
+      |> Plug.Conn.resp(503, "temporary")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: RetryAfterDisabledFinch,
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 retry: false
+               },
+               :logs
+             )
+
+    assert {:error, :retryable, {:http_status, 503}} = OtelApi.send_log_events(api, [])
+    assert Agent.get(attempts, & &1) == 1
+  end
+
+  @tag :otlp_retry_after
+  test "falls back when the response contains duplicate Retry-After fields" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: RetryAfterDuplicateFinch})
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      Agent.update(attempts, &(&1 + 1))
+
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", "0")
+      |> Plug.Conn.prepend_resp_headers([{"Retry-After", "0"}])
+      |> Plug.Conn.resp(503, "temporary")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{
+                 finch: RetryAfterDuplicateFinch,
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 otlp_timeout: 2_000
+               },
+               :logs
+             )
+
+    assert {:error, :retryable, {:http_status, 503}} = OtelApi.send_log_events(api, [])
+    assert Agent.get(attempts, & &1) == 2
+  end
+
   for status <- [429, 502, 503, 504] do
     test "retries HTTP #{status} and succeeds within the timeout" do
       bypass = Bypass.open()
