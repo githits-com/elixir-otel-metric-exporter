@@ -16,13 +16,23 @@ defmodule OtelMetricExporter.OtelApi do
   alias OtelMetricExporter.Protocol
 
   @opaque deadline :: integer()
+  @type failure_reason ::
+          :invalid_response
+          | :encoding_failed
+          | :deadline_exceeded
+          | :pool_timeout
+          | :transport_failure
+          | :request_failed
+          | :export_task_failed
+          | {:http_status, non_neg_integer()}
+  @type failure_disposition :: :terminal | :retryable
   @type export_result ::
           :ok
           | {:partial_success, non_neg_integer()}
-          | {:error, term()}
+          | {:error, failure_disposition(), failure_reason()}
 
   @retry_initial_delay 1_000
-  @transient_statuses [408, 429, 500, 502, 503, 504]
+  @transient_statuses [429, 502, 503, 504]
   @finch_checkout_timeout_prefix "Finch was unable to provide a connection within the timeout"
 
   @schema NimbleOptions.new!(
@@ -92,29 +102,23 @@ defmodule OtelMetricExporter.OtelApi do
 
   @spec send_proto(struct(), String.t(), %__MODULE__{}, deadline()) :: export_result()
   defp send_proto(body, path, %__MODULE__{} = api, deadline) do
-    request =
-      body
-      |> encode_to_iodata()
-      |> build_finch_request(path, api)
+    try do
+      request =
+        body
+        |> encode_to_iodata()
+        |> build_finch_request(path, api)
 
-    with {:ok, response_body} <-
-           make_finch_request(request, api.finch, deadline, with_retry?: api.retry) do
-      decode_response(response_body, api.scope)
+      with {:ok, response_body} <-
+             make_finch_request(request, api.finch, deadline, with_retry?: api.retry) do
+        decode_response(response_body, api.scope)
+      end
+    rescue
+      Protobuf.EncodeError -> {:error, :terminal, :encoding_failed}
     end
   end
 
   def encode_to_iodata(body) do
     Protobuf.encode_to_iodata(body)
-  rescue
-    e in Protobuf.EncodeError ->
-      raise Protobuf.EncodeError,
-        message: """
-        Failed to encode body: #{e.message}
-
-        Body:
-
-        #{inspect(body, pretty: true, limit: :infinity, printable_limit: :infinity)}
-        """
   end
 
   defp build_finch_request(body, path, %__MODULE__{} = api) do
@@ -143,12 +147,11 @@ defmodule OtelMetricExporter.OtelApi do
       {:ok, _response_body} = success ->
         success
 
-      {:error, {:unexpected_status, %{status: status}} = reason}
-      when status not in @transient_statuses ->
-        {:error, reason}
+      {:error, :terminal, _reason} = error ->
+        error
 
-      {:error, reason} ->
-        retry_after_error(request, finch_pool, deadline, retry_delays, {:error, reason})
+      {:error, :retryable, _reason} = error ->
+        retry_after_error(request, finch_pool, deadline, retry_delays, error)
     end
   end
 
@@ -230,7 +233,7 @@ defmodule OtelMetricExporter.OtelApi do
             normalize_finch_response(result)
 
           {:DOWN, ^monitor_ref, :process, ^worker_pid, _reason} ->
-            {:error, :request_failed}
+            {:error, :retryable, :request_failed}
         after
           timeout ->
             stop_finch_worker(request_ref, worker_pid, monitor_ref)
@@ -264,15 +267,28 @@ defmodule OtelMetricExporter.OtelApi do
 
   defp normalize_finch_response({:ok, %{status: 200, body: body}}), do: {:ok, body}
 
-  defp normalize_finch_response({:ok, %{status: status}}),
-    do: {:error, {:unexpected_status, %{status: status}}}
+  defp normalize_finch_response({:ok, %{status: status}}) when status in @transient_statuses,
+    do: {:error, :retryable, {:http_status, status}}
 
-  defp normalize_finch_response({:error, _reason} = error), do: error
+  defp normalize_finch_response({:ok, %{status: status}}),
+    do: {:error, :terminal, {:http_status, status}}
+
+  defp normalize_finch_response({:error, :pool_timeout}),
+    do: {:error, :retryable, :pool_timeout}
+
+  defp normalize_finch_response({:error, :request_failed}),
+    do: {:error, :retryable, :request_failed}
+
+  defp normalize_finch_response({:error, :retryable, :deadline_exceeded}),
+    do: {:error, :retryable, :deadline_exceeded}
+
+  defp normalize_finch_response({:error, _reason}),
+    do: {:error, :retryable, :transport_failure}
 
   defp checkout_timeout?(%RuntimeError{message: message}),
     do: String.starts_with?(message, @finch_checkout_timeout_prefix)
 
-  defp timeout_error, do: {:error, %Mint.TransportError{reason: :timeout}}
+  defp timeout_error, do: {:error, :retryable, :deadline_exceeded}
 
   # The pinned protobuf decoder leaks MatchError while matching truncated fixed-width
   # or length-delimited fields, so keep it inside the invalid-response boundary.
@@ -289,8 +305,8 @@ defmodule OtelMetricExporter.OtelApi do
         normalize_partial_success(rejected_count)
     end
   rescue
-    Protobuf.DecodeError -> {:error, :invalid_response}
-    MatchError -> {:error, :invalid_response}
+    Protobuf.DecodeError -> {:error, :terminal, :invalid_response}
+    MatchError -> {:error, :terminal, :invalid_response}
   end
 
   defp decode_response(body, :metrics) do
@@ -306,14 +322,15 @@ defmodule OtelMetricExporter.OtelApi do
         normalize_partial_success(rejected_count)
     end
   rescue
-    Protobuf.DecodeError -> {:error, :invalid_response}
-    MatchError -> {:error, :invalid_response}
+    Protobuf.DecodeError -> {:error, :terminal, :invalid_response}
+    MatchError -> {:error, :terminal, :invalid_response}
   end
 
   defp normalize_partial_success(rejected_count) when rejected_count >= 0,
     do: {:partial_success, rejected_count}
 
-  defp normalize_partial_success(_rejected_count), do: {:error, :invalid_response}
+  defp normalize_partial_success(_rejected_count),
+    do: {:error, :terminal, :invalid_response}
 
   @spec url(%__MODULE__{}, String.t()) :: String.t()
   defp url(

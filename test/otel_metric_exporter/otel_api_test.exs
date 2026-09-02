@@ -1,5 +1,6 @@
 defmodule OtelMetricExporter.OtelApiTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias OtelMetricExporter.Opentelemetry.Proto.Collector.Logs.V1.{
     ExportLogsPartialSuccess,
@@ -13,6 +14,7 @@ defmodule OtelMetricExporter.OtelApiTest do
 
   alias OtelMetricExporter.OtelApi
   alias OtelMetricExporter.OtelApi.Config
+  alias OtelMetricExporter.Opentelemetry.Proto.Metrics.V1.Metric
 
   setup do
     on_exit(fn ->
@@ -245,7 +247,7 @@ defmodule OtelMetricExporter.OtelApiTest do
     task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
     assert_receive {:request_received, request_pid}, 5_000
     on_exit(fn -> send(request_pid, :release) end)
-    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 5_000)
+    assert {:ok, {:error, :retryable, :deadline_exceeded}} = Task.yield(task, 5_000)
 
     Bypass.pass(bypass)
     send(request_pid, :release)
@@ -282,10 +284,10 @@ defmodule OtelMetricExporter.OtelApiTest do
     deadline = OtelApi.new_deadline(logs_api)
     Process.sleep(10)
 
-    assert {:error, %Mint.TransportError{reason: :timeout}} =
+    assert {:error, :retryable, :deadline_exceeded} =
              OtelApi.send_log_events(logs_api, [], deadline)
 
-    assert {:error, %Mint.TransportError{reason: :timeout}} =
+    assert {:error, :retryable, :deadline_exceeded} =
              OtelApi.send_metrics(metrics_api, [], deadline)
 
     refute_receive :unexpected_request, 100
@@ -369,7 +371,7 @@ defmodule OtelMetricExporter.OtelApiTest do
         OtelApi.send_log_events(api, [])
       end)
 
-    assert {:ok, {:error, :request_failed}} = Task.yield(task, 1_000)
+    assert {:ok, {:error, :retryable, :request_failed}} = Task.yield(task, 1_000)
   end
 
   @tag :otlp_deadline_handoff
@@ -417,7 +419,7 @@ defmodule OtelMetricExporter.OtelApiTest do
 
     assert_receive {:request_received, request_pid}, 1_000
     on_exit(fn -> send(request_pid, :release) end)
-    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 2_200)
+    assert {:ok, {:error, :retryable, :deadline_exceeded}} = Task.yield(task, 2_200)
 
     Bypass.pass(bypass)
     send(request_pid, :release)
@@ -493,6 +495,63 @@ defmodule OtelMetricExporter.OtelApiTest do
     assert_receive {:request_attempt, 2}, 2_000
     assert {:ok, :ok} = Task.yield(task, 1_000)
     assert Agent.get(attempts, & &1) == 2
+  end
+
+  for status <- [429, 502, 503, 504] do
+    test "retries HTTP #{status} and succeeds within the timeout" do
+      bypass = Bypass.open()
+      {:ok, _} = start_supervised({Finch, name: TestFinch})
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+        attempt = Agent.get_and_update(attempts, fn count -> {count + 1, count + 1} end)
+
+        case attempt do
+          1 -> Plug.Conn.resp(conn, unquote(status), "temporary")
+          2 -> Plug.Conn.resp(conn, 200, "")
+        end
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(
+                 %{
+                   finch: TestFinch,
+                   otlp_endpoint: "http://localhost:#{bypass.port}",
+                   otlp_timeout: 3_000
+                 },
+                 :logs
+               )
+
+      assert :ok = OtelApi.send_log_events(api, [])
+      assert Agent.get(attempts, & &1) == 2
+    end
+  end
+
+  for status <- [408, 500] do
+    test "does not retry HTTP #{status}" do
+      bypass = Bypass.open()
+      {:ok, _} = start_supervised({Finch, name: TestFinch})
+      parent = self()
+
+      Bypass.expect_once(bypass, "POST", "/v1/logs", fn conn ->
+        send(parent, :request_finished)
+        Plug.Conn.resp(conn, unquote(status), "permanent")
+      end)
+
+      assert {:ok, api, %{}} =
+               OtelApi.new(
+                 %{
+                   finch: TestFinch,
+                   otlp_endpoint: "http://localhost:#{bypass.port}",
+                   otlp_timeout: 3_000
+                 },
+                 :logs
+               )
+
+      task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
+      assert_receive :request_finished, 5_000
+      assert {:ok, {:error, :terminal, {:http_status, unquote(status)}}} = Task.yield(task, 1_000)
+    end
   end
 
   test "returns log partial success without retrying" do
@@ -582,7 +641,7 @@ defmodule OtelMetricExporter.OtelApiTest do
                :logs
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_log_events(api, [])
   end
 
   test "rejects a negative metric partial-success count without retrying" do
@@ -603,7 +662,7 @@ defmodule OtelMetricExporter.OtelApiTest do
                :metrics
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_metrics(api, [])
   end
 
   test "returns invalid response for malformed log response without retrying" do
@@ -620,7 +679,7 @@ defmodule OtelMetricExporter.OtelApiTest do
                :logs
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_log_events(api, [])
   end
 
   test "returns invalid response for malformed metric response without retrying" do
@@ -637,7 +696,7 @@ defmodule OtelMetricExporter.OtelApiTest do
                :metrics
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_metrics(api, [])
   end
 
   test "returns invalid response for a JSON log response without retrying" do
@@ -654,7 +713,7 @@ defmodule OtelMetricExporter.OtelApiTest do
                :logs
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_log_events(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_log_events(api, [])
   end
 
   test "returns invalid response for a JSON metric response without retrying" do
@@ -671,7 +730,39 @@ defmodule OtelMetricExporter.OtelApiTest do
                :metrics
              )
 
-    assert {:error, :invalid_response} = OtelApi.send_metrics(api, [])
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_metrics(api, [])
+  end
+
+  test "returns terminal encoding failure without sending the metric payload" do
+    bypass = Bypass.open()
+    {:ok, _} = start_supervised({Finch, name: EncodingFinch})
+    parent = self()
+
+    Bypass.stub(bypass, "POST", "/v1/metrics", fn conn ->
+      send(parent, :unexpected_request)
+      Plug.Conn.resp(conn, 200, "")
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: EncodingFinch, otlp_endpoint: "http://localhost:#{bypass.port}"},
+               :metrics
+             )
+
+    log =
+      capture_log(fn ->
+        send(
+          self(),
+          {:encoding_result, OtelApi.send_metrics(api, [%Metric{name: :invalid_metric_name}])}
+        )
+      end)
+
+    assert_receive {:encoding_result, result}
+
+    assert result == {:error, :terminal, :encoding_failed}
+    refute inspect(result) =~ "invalid_metric_name"
+    refute log =~ "invalid_metric_name"
+    refute_receive :unexpected_request, 100
   end
 
   test "does not retry after the timeout budget is exhausted" do
@@ -703,7 +794,7 @@ defmodule OtelMetricExporter.OtelApiTest do
     task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
     assert_receive {:request_attempt, 1, request_pid}, 5_000
     on_exit(fn -> send(request_pid, :release) end)
-    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 5_000)
+    assert {:ok, {:error, :retryable, :deadline_exceeded}} = Task.yield(task, 5_000)
     assert Agent.get(attempts, & &1) == 1
 
     Bypass.pass(bypass)
@@ -734,7 +825,7 @@ defmodule OtelMetricExporter.OtelApiTest do
 
     task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
     assert_receive :request_finished, 5_000
-    assert {:ok, {:error, {:unexpected_status, %{status: 400}}}} = Task.yield(task, 1_000)
+    assert {:ok, {:error, :terminal, {:http_status, 400}}} = Task.yield(task, 1_000)
     assert Agent.get(attempts, & &1) == 1
   end
 
@@ -767,8 +858,8 @@ defmodule OtelMetricExporter.OtelApiTest do
              )
 
     task = Task.async(fn -> OtelApi.send_log_events(api, []) end)
-    assert {:ok, {:error, reason}} = Task.yield(task, 1_000)
-    assert reason == :pool_timeout or match?(%Mint.TransportError{reason: :timeout}, reason)
+    assert {:ok, {:error, :retryable, reason}} = Task.yield(task, 1_000)
+    assert reason in [:pool_timeout, :deadline_exceeded]
 
     Bypass.pass(bypass)
     send(holder_pid, :release_holder)
@@ -814,7 +905,7 @@ defmodule OtelMetricExporter.OtelApiTest do
     assert_receive {:request_started, 2, request_pid}, 1_000
     on_exit(fn -> send(request_pid, :release_request) end)
 
-    assert {:ok, {:error, %Mint.TransportError{reason: :timeout}}} = Task.yield(task, 1_000)
+    assert {:ok, {:error, :retryable, :deadline_exceeded}} = Task.yield(task, 1_000)
     elapsed = System.monotonic_time(:millisecond) - started_at
     assert elapsed < 1_750
 

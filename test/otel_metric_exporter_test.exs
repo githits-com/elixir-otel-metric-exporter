@@ -43,6 +43,30 @@ defmodule OtelMetricExporterTest do
       assert {:error, _} = OtelMetricExporter.start_link([])
       assert {:error, _} = OtelMetricExporter.start_link(otlp_protocol: :invalid)
     end
+
+    test "redacts invalid header values from start_link errors" do
+      secret = "top-level-header-secret"
+      metrics = [Metrics.counter("test.counter")]
+
+      log =
+        capture_log(fn ->
+          assert {:error, error} =
+                   OtelMetricExporter.start_link(
+                     Keyword.put(
+                       @base_config ++ [metrics: metrics],
+                       :otlp_headers,
+                       %{"authorization" => "bad\n#{secret}"}
+                     )
+                   )
+
+          assert error.key == :otlp_headers
+          assert error.value == :redacted
+          refute inspect(error) =~ secret
+          refute Exception.message(error) =~ secret
+        end)
+
+      refute log =~ secret
+    end
   end
 
   describe "telemetry integration" do

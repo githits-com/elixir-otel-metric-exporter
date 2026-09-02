@@ -192,7 +192,7 @@ defmodule OtelMetricExporter.MetricStoreTest do
       assert :ok = MetricStore.export_sync(@name)
     end
 
-    test "handles server errors gracefully", %{bypass: bypass, store_config: config} do
+    test "clears metrics after a terminal server error", %{bypass: bypass, store_config: config} do
       metric = Metrics.sum("test.sum")
       tags = %{test: "value"}
       start_supervised!({MetricStore, %{config | metrics: [metric]}})
@@ -203,13 +203,19 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
       MetricStore.write_metric(@name, metric, 1, tags)
 
-      metrics = MetricStore.get_metrics(@name)
-
       # Export metrics synchronously
-      assert capture_log(fn -> MetricStore.export_sync(@name) end) =~ "Failed to export metrics"
+      log =
+        capture_log(fn ->
+          assert {:error, :terminal, {:http_status, 500}} = MetricStore.export_sync(@name)
+        end)
 
-      # Verify metrics were not cleared due to error
-      assert MetricStore.get_metrics(@name, 0) == metrics
+      assert log =~ "Failed to export metrics"
+      assert log =~ "disposition=terminal"
+      assert log =~ "reason=http_status=500"
+      refute log =~ "Internal Server Error"
+
+      # Terminal responses are not retained because the receiver may have consumed the batch.
+      assert MetricStore.get_metrics(@name, 0) == %{}
     end
 
     test "handles connection errors gracefully", %{bypass: bypass, store_config: config} do
@@ -224,10 +230,75 @@ defmodule OtelMetricExporter.MetricStoreTest do
       metrics = MetricStore.get_metrics(@name)
 
       # Export metrics synchronously
-      assert capture_log(fn -> MetricStore.export_sync(@name) end) =~ "Failed to export metrics"
+      log =
+        capture_log(fn ->
+          assert {:error, :retryable, :transport_failure} = MetricStore.export_sync(@name)
+        end)
+
+      assert log =~ "Failed to export metrics"
+      assert log =~ "disposition=retryable"
+      assert log =~ "reason=transport_failure"
 
       # Verify metrics were not cleared due to error
       assert MetricStore.get_metrics(@name, 0) == metrics
+    end
+
+    test "normalizes an export worker exit and retains attempted metrics", %{store_config: config} do
+      metric = Metrics.sum("test.sum")
+
+      store_pid =
+        start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      MetricStore.write_metric(@name, metric, 1, %{test: "value"})
+
+      :sys.replace_state(@name, fn state ->
+        bad_config = %{state.api.config | resource: :invalid_resource}
+        %{state | api: %{state.api | config: bad_config}}
+      end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :retryable, :export_task_failed} = MetricStore.export_sync(@name)
+        end)
+
+      assert Process.alive?(store_pid)
+      assert MetricStore.get_metrics(@name, 0) != %{}
+      refute log =~ "test.sum"
+    end
+
+    test "kills an overdue export worker and retains attempted metrics", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      parent = self()
+
+      store_pid =
+        start_supervised!(
+          {MetricStore,
+           Map.merge(config, %{metrics: [metric], export_period: 60_000, otlp_timeout: 1_000})}
+        )
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        send(parent, {:request_started, self()})
+
+        receive do
+          :release -> Plug.Conn.resp(conn, 200, "")
+        end
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, %{test: "value"})
+
+      task = Task.async(fn -> MetricStore.export_sync(@name) end)
+      assert_receive {:request_started, request_pid}, 5_000
+      on_exit(fn -> send(request_pid, :release) end)
+
+      assert {:ok, {:error, :retryable, :deadline_exceeded}} = Task.yield(task, 2_000)
+      assert Process.alive?(store_pid)
+      assert MetricStore.get_metrics(@name, 0) != %{}
+
+      Bypass.pass(bypass)
+      send(request_pid, :release)
     end
 
     test "clears metrics and generations after partial success", %{
@@ -277,10 +348,14 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
       log =
         capture_log(fn ->
-          assert {:error, :invalid_response} = MetricStore.export_sync(@name)
+          assert {:error, :terminal, :invalid_response} = MetricStore.export_sync(@name)
         end)
 
-      assert log =~ "Failed to export metrics: :invalid_response"
+      assert log =~ "Failed to export metrics"
+      assert log =~ "disposition=terminal"
+      assert log =~ "reason=invalid_response"
+      refute log =~ "receiver rejected"
+      refute log =~ "partialSuccess"
       assert Process.alive?(store_pid)
       assert MetricStore.get_metrics(@name, 0) == %{}
       assert MetricStore.get_metrics(@name, 1) == %{}
@@ -301,12 +376,20 @@ defmodule OtelMetricExporter.MetricStoreTest do
       # First generation
       MetricStore.write_metric(@name, metric, 1, tags)
 
-      # First export fails
+      # First export is retryable
       Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
-        Plug.Conn.resp(conn, 500, "Internal Server Error")
+        Plug.Conn.resp(conn, 503, "Service Unavailable")
       end)
 
-      capture_log(fn -> MetricStore.export_sync(@name) end)
+      log =
+        capture_log(fn ->
+          assert {:error, :retryable, {:http_status, 503}} = MetricStore.export_sync(@name)
+        end)
+
+      assert log =~ "Failed to export metrics"
+      assert log =~ "disposition=retryable"
+      assert log =~ "reason=http_status=503"
+      refute log =~ "Service Unavailable"
 
       # Second generation
       MetricStore.write_metric(@name, metric, 2, tags)

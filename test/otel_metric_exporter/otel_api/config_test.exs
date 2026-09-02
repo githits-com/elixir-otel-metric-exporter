@@ -102,6 +102,45 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
                OtelMetricExporter.OtelApi.Config.defaults()
     end
 
+    test "rejects invalid application header values without exposing them" do
+      secret = "application-header-secret"
+
+      Application.put_env(:otel_metric_exporter, :otlp_headers, %{
+        "authorization" => "bad\n#{secret}"
+      })
+
+      log =
+        capture_log(fn ->
+          assert {:error, error} = OtelMetricExporter.OtelApi.Config.defaults()
+          assert error.key == :otlp_headers
+          assert error.value == :redacted
+          refute inspect(error) =~ secret
+          refute Exception.message(error) =~ secret
+        end)
+
+      refute log =~ secret
+    end
+
+    test "redacts invalid nested application header values while preserving the path" do
+      secret = "nested-application-header-secret"
+
+      Application.put_env(:otel_metric_exporter, :logs, %{
+        otlp_headers: %{"authorization" => "bad\n#{secret}"}
+      })
+
+      log =
+        capture_log(fn ->
+          assert {:error, error} = OtelMetricExporter.OtelApi.Config.defaults()
+          assert error.key == :otlp_headers
+          assert error.keys_path == [:logs]
+          assert error.value == :redacted
+          refute inspect(error) =~ secret
+          refute Exception.message(error) =~ secret
+        end)
+
+      refute log =~ secret
+    end
+
     test "discards malformed header members" do
       System.put_env("OTEL_EXPORTER_OTLP_HEADERS", "valid=value,malformed")
 
@@ -217,6 +256,44 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
   end
 
   describe "validate_for_scope/2" do
+    test "accepts valid direct header maps" do
+      assert {:ok,
+              %OtelMetricExporter.OtelApi.Config{
+                otlp_headers: %{"authorization" => "Bearer placeholder-token"}
+              }, %{}} =
+               OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                 %{
+                   otlp_endpoint: "http://localhost:4318",
+                   otlp_headers: %{"authorization" => "Bearer placeholder-token"}
+                 },
+                 :logs
+               )
+    end
+
+    test "rejects invalid direct header keys and values without exposing them" do
+      secret = "direct-header-secret"
+
+      log =
+        capture_log(fn ->
+          assert {:error, error} =
+                   OtelMetricExporter.OtelApi.Config.validate_for_scope(
+                     %{
+                       otlp_endpoint: "http://localhost:4318",
+                       otlp_headers: %{"invalid key" => "bad\n#{secret}"}
+                     },
+                     :logs
+                   )
+
+          assert error.key == :otlp_headers
+          assert error.value == :redacted
+          refute inspect(error) =~ secret
+          refute Exception.message(error) =~ "invalid key"
+          refute Exception.message(error) =~ secret
+        end)
+
+      refute log =~ secret
+    end
+
     test "marks a direct endpoint as generic" do
       assert {:ok, %OtelMetricExporter.OtelApi.Config{otlp_endpoint_kind: :generic}, %{}} =
                OtelMetricExporter.OtelApi.Config.validate_for_scope(
@@ -303,11 +380,14 @@ defmodule OtelMetricExporter.OtelApi.ConfigTest do
 
     @tag :otlp_validation_boundary
     test "rejects zero concurrent requests" do
-      assert {:error, %{key: :otlp_concurrent_requests}} =
+      assert {:error, error} =
                OtelMetricExporter.OtelApi.Config.validate_for_scope(
                  %{otlp_endpoint: "http://localhost:4317", otlp_concurrent_requests: 0},
                  :logs
                )
+
+      assert error.key == :otlp_concurrent_requests
+      assert error.value == 0
     end
   end
 end

@@ -2,6 +2,7 @@ defmodule OtelMetricExporter do
   use Supervisor
   require Logger
   alias OtelMetricExporter.OtelApi
+  alias OtelMetricExporter.OtelApi.Config
   alias OtelMetricExporter.MetricStore
   alias OtelMetricExporter.TelemetryHandlers
   alias Telemetry.Metrics
@@ -85,7 +86,7 @@ defmodule OtelMetricExporter do
   def start_link(opts) do
     opts = combine_opts(opts)
 
-    with {:ok, validated} <- NimbleOptions.validate(opts, @options_schema) do
+    with {:ok, validated} <- Config.validate(opts, @options_schema) do
       Supervisor.start_link(__MODULE__, Map.new(validated))
     end
   end

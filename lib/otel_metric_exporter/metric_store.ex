@@ -244,13 +244,12 @@ defmodule OtelMetricExporter.MetricStore do
       convert_metric(metric, tagged_values)
     end)
     |> then(fn payload ->
-      task = Task.async(fn -> OtelApi.send_metrics(state.api, payload) end)
+      deadline = OtelApi.new_deadline(state.api)
 
-      case Task.yield(task, 20_000) || Task.shutdown(task) do
-        {:ok, result} -> result
-        {:exit, reason} -> {:error, reason}
-        nil -> {:error, :timeout}
-      end
+      {worker_pid, monitor_ref, result_ref} =
+        spawn_export_worker(state.api, payload, deadline)
+
+      await_export_task(result_ref, worker_pid, monitor_ref, deadline)
     end)
     |> case do
       :ok ->
@@ -261,16 +260,122 @@ defmodule OtelMetricExporter.MetricStore do
         clear_exported_metrics(state, earliest_gen, current_gen)
         result
 
-      {:error, :invalid_response} = result ->
-        Logger.error("Failed to export metrics: :invalid_response")
+      {:error, :terminal, reason} = result ->
+        log_export_failure(:terminal, reason)
         clear_exported_metrics(state, earliest_gen, current_gen)
         result
 
-      {:error, reason} ->
-        Logger.error("Failed to export metrics: #{inspect(reason)}")
-        {:error, reason}
+      {:error, :retryable, reason} = result ->
+        log_export_failure(:retryable, reason)
+        result
     end
   end
+
+  @spec spawn_export_worker(%OtelApi{}, list(), OtelApi.deadline()) ::
+          {pid(), reference(), reference()}
+  defp spawn_export_worker(api, payload, deadline) do
+    parent = self()
+    result_ref = make_ref()
+
+    {worker_pid, monitor_ref} =
+      :erlang.spawn_opt(
+        fn ->
+          result = OtelApi.send_metrics(api, payload, deadline)
+          send(parent, {result_ref, result})
+        end,
+        [:monitor]
+      )
+
+    {worker_pid, monitor_ref, result_ref}
+  end
+
+  @spec await_export_task(reference(), pid(), reference(), OtelApi.deadline()) ::
+          OtelApi.export_result()
+  defp await_export_task(result_ref, worker_pid, monitor_ref, deadline) do
+    case OtelApi.remaining_timeout(deadline) do
+      timeout when is_integer(timeout) ->
+        receive do
+          {^result_ref, result} ->
+            Process.demonitor(monitor_ref, [:flush])
+            result
+
+          {:DOWN, ^monitor_ref, :process, ^worker_pid, _reason} ->
+            Process.demonitor(monitor_ref, [:flush])
+            {:error, :retryable, :export_task_failed}
+        after
+          timeout ->
+            await_export_at_deadline(result_ref, worker_pid, monitor_ref)
+        end
+
+      :expired ->
+        await_export_at_deadline(result_ref, worker_pid, monitor_ref)
+    end
+  end
+
+  @spec await_export_at_deadline(reference(), pid(), reference()) :: OtelApi.export_result()
+  defp await_export_at_deadline(result_ref, worker_pid, monitor_ref) do
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^worker_pid, _reason} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, :retryable, :export_task_failed}
+    after
+      0 ->
+        case stop_export_worker(result_ref, worker_pid, monitor_ref) do
+          {:result, result} -> result
+          :none -> {:error, :retryable, :deadline_exceeded}
+        end
+    end
+  end
+
+  @spec stop_export_worker(reference(), pid(), reference()) ::
+          {:result, OtelApi.export_result()} | :none
+  defp stop_export_worker(result_ref, worker_pid, monitor_ref) do
+    Process.exit(worker_pid, :kill)
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^worker_pid, _reason} ->
+        Process.demonitor(monitor_ref, [:flush])
+        take_export_result(result_ref)
+    end
+  end
+
+  @spec take_export_result(reference()) :: {:result, OtelApi.export_result()} | :none
+  defp take_export_result(result_ref) do
+    receive do
+      {^result_ref, result} -> {:result, result}
+    after
+      0 -> :none
+    end
+  end
+
+  @spec log_export_failure(OtelApi.failure_disposition(), OtelApi.failure_reason()) :: :ok
+  defp log_export_failure(disposition, reason) do
+    Logger.error(
+      "Failed to export metrics: disposition=#{format_disposition(disposition)} reason=#{format_failure_reason(reason)}",
+      disposition: disposition,
+      reason: reason
+    )
+  end
+
+  @spec format_disposition(OtelApi.failure_disposition()) :: String.t()
+  defp format_disposition(:terminal), do: "terminal"
+  defp format_disposition(:retryable), do: "retryable"
+
+  @spec format_failure_reason(OtelApi.failure_reason()) :: String.t()
+  defp format_failure_reason(:invalid_response), do: "invalid_response"
+  defp format_failure_reason(:encoding_failed), do: "encoding_failed"
+  defp format_failure_reason(:deadline_exceeded), do: "deadline_exceeded"
+  defp format_failure_reason(:pool_timeout), do: "pool_timeout"
+  defp format_failure_reason(:transport_failure), do: "transport_failure"
+  defp format_failure_reason(:request_failed), do: "request_failed"
+  defp format_failure_reason(:export_task_failed), do: "export_task_failed"
+
+  defp format_failure_reason({:http_status, status}),
+    do: "http_status=#{Integer.to_string(status)}"
 
   @spec clear_exported_metrics(%State{}, non_neg_integer(), non_neg_integer()) :: :ok
   defp clear_exported_metrics(state, earliest_gen, current_gen) do

@@ -39,7 +39,8 @@ defmodule OtelMetricExporter.OtelApi.Config do
         doc: "Protocol to use for OTLP export. Currently only `:http_protobuf` is supported."
       ],
       otlp_headers: [
-        type: {:map, :string, :string},
+        type: {:custom, __MODULE__, :validate_otlp_headers, []},
+        type_spec: quote(do: %{String.t() => String.t()}),
         default: %{},
         doc: "Headers to send with OTLP requests."
       ],
@@ -103,6 +104,35 @@ defmodule OtelMetricExporter.OtelApi.Config do
 
   def public_options(), do: @public_options
   def options_schema(), do: @options_schema
+
+  @doc false
+  @spec validate(keyword() | map(), NimbleOptions.t() | NimbleOptions.schema()) ::
+          {:ok, keyword() | map()} | {:error, NimbleOptions.ValidationError.t()}
+  def validate(options, schema) do
+    case NimbleOptions.validate(options, schema) do
+      {:error, %NimbleOptions.ValidationError{key: :otlp_headers} = error} ->
+        {:error, %{error | value: :redacted}}
+
+      result ->
+        result
+    end
+  end
+
+  @doc false
+  @spec validate_otlp_headers(term()) ::
+          {:ok, %{String.t() => String.t()}} | {:error, String.t()}
+  def validate_otlp_headers(headers) when is_map(headers) do
+    if Enum.all?(headers, fn {key, value} ->
+         is_binary(key) and is_binary(value) and valid_http_token?(key) and
+           valid_header_value_bytes?(value)
+       end) do
+      {:ok, headers}
+    else
+      {:error, "invalid HTTP header key or value"}
+    end
+  end
+
+  def validate_otlp_headers(_headers), do: {:error, "expected a map of HTTP headers"}
 
   defp defaults_from_env do
     base =
@@ -324,7 +354,7 @@ defmodule OtelMetricExporter.OtelApi.Config do
     from_env =
       defaults_from_env()
       |> Map.take(Keyword.keys(@public_options))
-      |> NimbleOptions.validate(options_schema())
+      |> validate(options_schema())
       |> case do
         {:ok, validated} -> validated
         {:error, _} -> %{}
@@ -340,7 +370,7 @@ defmodule OtelMetricExporter.OtelApi.Config do
       k, v1, v2 when k in [:logs, :metrics, :resource] -> Map.merge(Map.new(v1), Map.new(v2))
       _, _, v2 -> v2
     end)
-    |> NimbleOptions.validate(options_schema())
+    |> validate(options_schema())
   end
 
   @spec validate_for_scope(map(), :logs | :metrics) ::
@@ -361,7 +391,7 @@ defmodule OtelMetricExporter.OtelApi.Config do
 
       case Map.get(with_overrides, :exporter) do
         x when x in [:otlp, nil] ->
-          with {:ok, validated} <- NimbleOptions.validate(with_overrides, @single_scope_schema) do
+          with {:ok, validated} <- validate(with_overrides, @single_scope_schema) do
             {:ok, struct!(__MODULE__, Map.put(validated, :otlp_endpoint_kind, endpoint_kind)),
              rest}
           end
