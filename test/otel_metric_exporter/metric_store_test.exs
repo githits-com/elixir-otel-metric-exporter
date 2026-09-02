@@ -126,6 +126,14 @@ defmodule OtelMetricExporter.MetricStoreTest do
     end
   end
 
+  test "disabled exporter does not create metric state", %{store_config: config} do
+    Application.put_env(:otel_metric_exporter, :metrics, exporter: :none)
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :metrics) end)
+
+    assert :ignore = MetricStore.start_link(%{config | name: :disabled_metric_store_test})
+    assert :ets.whereis(:disabled_metric_store_test) == :undefined
+  end
+
   describe "export flow" do
     test "emits one success event with OTLP data-point count", %{
       bypass: bypass,

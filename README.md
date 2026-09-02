@@ -40,3 +40,24 @@ terms are included.
 For logs, a final failure drops the full batch. For metrics, a terminal failure
 drops the full data-point batch, while a retryable failure retains it. Partial
 success reports rejected items separately and does not count them as dropped.
+
+## Configuration changes
+
+The log handler resolves its exporter, timeout, and concurrency settings when it
+starts. `exporter: :none` leaves a configured Logger handler as an inert
+no-op and starts no transport processes. Changing the exporter, OTLP timeout,
+or concurrent-request limit requires removing and adding the handler again so
+its shutdown allowance and connection pool are rebuilt together.
+
+For metrics, `exporter: :none` keeps the top-level supervisor alive but starts
+neither `MetricStore` nor telemetry handlers, ETS state, or export timers.
+
+`filter_config/1` output is diagnostic: header values and endpoint userinfo are
+redacted, so it must not be reused as a handler configuration. OTP applies OLP
+options and accumulator configuration through separate calls; if the
+accumulator stays busy long enough to reject a live change, remove and add the
+handler again before retrying the change.
+
+Logger `:set` operations rebuild handler configuration from application and
+environment defaults; values supplied only when the handler was first added
+must be supplied again or moved into those defaults.

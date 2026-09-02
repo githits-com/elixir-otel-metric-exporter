@@ -423,7 +423,11 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
         max_buffer_size: 1
       })
 
-    :ok = :logger.set_handler_config(handler_id, %{config: config})
+    supervisor_pid = Process.whereis(:"#{LogHandler}_#{handler_id}")
+    supervisor_ref = Process.monitor(supervisor_pid)
+    :ok = :logger.remove_handler(handler_id)
+    assert_receive {:DOWN, ^supervisor_ref, :process, ^supervisor_pid, _reason}, 1_000
+    :ok = :logger.add_handler(handler_id, LogHandler, %{config: config})
     parent = self()
 
     Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->

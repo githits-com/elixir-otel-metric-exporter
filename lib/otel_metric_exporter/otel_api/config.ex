@@ -402,6 +402,36 @@ defmodule OtelMetricExporter.OtelApi.Config do
     end
   end
 
+  @doc """
+  Validates an already-resolved signal configuration without reading application
+  or environment defaults.
+
+  The input must include its effective `:exporter` and `:otlp_endpoint_kind`.
+  This boundary is for retaining installed runtime state during partial updates;
+  callers that are resolving public configuration must use `validate_for_scope/2`.
+  """
+  @spec validate_effective_for_scope(map(), :logs | :metrics) ::
+          {:ok, %__MODULE__{}, map()} | {:error, term()}
+  def validate_effective_for_scope(config, scope) when scope in [:logs, :metrics] do
+    effective_keys = Keyword.keys(@public_options) ++ [:otlp_endpoint_kind, :exporter]
+    {effective, rest} = Map.split(Map.new(config), effective_keys)
+    {endpoint_kind, effective} = Map.pop(effective, :otlp_endpoint_kind)
+    effective = Map.update(effective, :resource, %{}, &normalize_resources/1)
+
+    case {Map.get(effective, :exporter), endpoint_kind} do
+      {:none, endpoint_kind} when endpoint_kind in [:generic, :signal] ->
+        {:ok, %__MODULE__{exporter: :none, otlp_endpoint_kind: endpoint_kind}, rest}
+
+      {:otlp, endpoint_kind} when endpoint_kind in [:generic, :signal] ->
+        with {:ok, validated} <- validate(effective, @single_scope_schema) do
+          {:ok, struct!(__MODULE__, Map.put(validated, :otlp_endpoint_kind, endpoint_kind)), rest}
+        end
+
+      {exporter, _endpoint_kind} ->
+        {:error, {:invalid_effective_exporter, exporter}}
+    end
+  end
+
   @spec endpoint_kind(map(), map(), :logs | :metrics) :: endpoint_kind()
   defp endpoint_kind(provided, defaults, scope) do
     cond do

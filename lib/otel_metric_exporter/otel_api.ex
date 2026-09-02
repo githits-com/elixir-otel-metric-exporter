@@ -99,6 +99,30 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
+  @doc """
+  Builds an API from normalized effective signal options without resolving
+  application or environment defaults.
+
+  Use `new/2` when resolving public configuration. This function exists so a
+  partial runtime update can retain the exact signal configuration installed at
+  startup.
+  """
+  @spec new_effective(map(), :logs | :metrics) ::
+          {:ok, %__MODULE__{}, map()} | {:error, term()}
+  def new_effective(opts, scope) do
+    with {:ok, config, rest} <- Config.validate_effective_for_scope(opts, scope),
+         {own_opts, rest} <- Map.split(rest, [:finch, :retry]),
+         {:ok, validated} <- NimbleOptions.validate(own_opts, @schema) do
+      {:ok,
+       %__MODULE__{
+         config: config,
+         scope: scope,
+         finch: validated.finch,
+         retry: validated.retry
+       }, rest}
+    end
+  end
+
   @spec send_log_events(%__MODULE__{}, list()) :: export_result()
   def send_log_events(%__MODULE__{} = api, events),
     do: send_log_events(api, events, new_deadline(api))

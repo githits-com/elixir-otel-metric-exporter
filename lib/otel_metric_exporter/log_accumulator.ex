@@ -83,14 +83,35 @@ defmodule OtelMetricExporter.LogAccumulator do
       Map.new(config)
       |> Map.put(:finch, :"#{base_name}_Finch")
 
-    with {:ok, api, rest} <- OtelApi.new(config, :logs),
-         {:ok, validated} <- NimbleOptions.validate(rest, @schema) do
+    with {:ok, api, rest} <- OtelApi.new(config, :logs) do
+      validate_accumulator_config(api, rest, base_name)
+    end
+  end
+
+  defp validate_accumulator_config(api, config, base_name) do
+    with {:ok, validated} <- NimbleOptions.validate(config, @schema) do
       {:ok,
        Map.put(validated, :api, api) |> Map.put(:task_supervisor, :"#{base_name}_TaskSupervisor")}
     end
   end
 
-  def init(%{api: %{config: %{exporter: :none}}}), do: :ignore
+  @doc """
+  Validates accumulator options around an already-resolved effective log API.
+
+  Unlike `check_config/2`, this function does not resolve application or
+  environment defaults. It is used by the Logger partial-update boundary to
+  preserve the installed signal configuration.
+  """
+  @spec check_effective_config(map(), atom()) :: {:ok, map()} | {:error, term()}
+  def check_effective_config(config, base_name) do
+    config =
+      Map.new(config)
+      |> Map.put(:finch, :"#{base_name}_Finch")
+
+    with {:ok, api, rest} <- OtelApi.new_effective(config, :logs) do
+      validate_accumulator_config(api, rest, base_name)
+    end
+  end
 
   def init(config) do
     Process.flag(:trap_exit, true)

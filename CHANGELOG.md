@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Add bounded completion telemetry for log and metric export batches.
+- Make disabled exporters inert and reject live log transport changes that
+  would invalidate their startup resources.
 
 ## [0.3.6] - 2025-04-08
 

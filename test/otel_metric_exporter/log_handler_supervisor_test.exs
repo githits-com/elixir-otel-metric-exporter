@@ -6,6 +6,8 @@ defmodule OtelMetricExporter.LogHandlerSupervisorTest do
   alias OtelMetricExporter.LogAccumulator
   alias OtelMetricExporter.LogHandler
   alias OtelMetricExporter.LogHandlerSupervisor
+  alias OtelMetricExporter.OtelApi
+  alias OtelMetricExporter.OtelApi.Config
 
   setup do
     bypass = Bypass.open()
@@ -45,6 +47,28 @@ defmodule OtelMetricExporter.LogHandlerSupervisorTest do
 
     assert Process.alive?(supervisor_pid)
     assert :logger_olp.get_pid(olp) |> Process.alive?()
+  end
+
+  test "stops transport children when the OLP child cannot start", %{config: config} do
+    base_name = String.to_atom("olp_start_failure_#{System.unique_integer([:positive])}")
+    olp_name = String.to_atom("#{base_name}_logger_olp")
+
+    {:ok, existing_pid, _olp} =
+      :logger_olp.start_link(olp_name, LogAccumulator, config, %{})
+
+    Process.unlink(existing_pid)
+    on_exit(fn -> :gen_server.stop(existing_pid) end)
+
+    assert {:error, _reason} =
+             LogHandlerSupervisor.start_link(
+               name: base_name,
+               accumulator_config: config,
+               olp_config: %{}
+             )
+
+    assert Process.whereis(base_name) == nil
+    assert Process.whereis(String.to_atom("#{base_name}_Finch")) == nil
+    assert Process.whereis(String.to_atom("#{base_name}_TaskSupervisor")) == nil
   end
 
   test "shutdown with an empty queue sends no request", %{bypass: bypass, config: config} do
@@ -336,6 +360,449 @@ defmodule OtelMetricExporter.LogHandlerSupervisorTest do
     assert :ok = Supervisor.stop(supervisor_pid, :normal, 5_000)
   end
 
+  test "adding_handler propagates supervisor start errors", %{bypass: bypass} do
+    id = String.to_atom("duplicate_handler_#{System.unique_integer([:positive])}")
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{otlp_endpoint: "http://localhost:#{bypass.port}"}
+    }
+
+    assert {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    assert {:error, _reason} = LogHandler.adding_handler(handler_config)
+  end
+
+  test "changing_config updates normalized state from a partial public update", %{bypass: bypass} do
+    id = String.to_atom("partial_update_#{System.unique_integer([:positive])}")
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{
+        otlp_endpoint: "http://localhost:#{bypass.port}",
+        otlp_headers: %{"authorization" => "placeholder-secret"},
+        otlp_timeout: 1_000,
+        otlp_concurrent_requests: 2,
+        otlp_compression: nil,
+        retry: false,
+        resource: %{instance: %{id: "test"}},
+        debounce_ms: 100,
+        max_buffer_size: 20
+      }
+    }
+
+    {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    old_config = installed.config
+    old_api_config = old_config.api.config
+    old_olp_opts = :logger_olp.get_opts(old_config.olp)
+    requested_count = old_olp_opts.burst_limit_max_count + 1
+
+    assert {:ok, updated} =
+             LogHandler.changing_config(:update, installed, %{
+               config: %{max_buffer_size: 9, burst_limit_max_count: requested_count}
+             })
+
+    assert updated.config.max_buffer_size == 9
+    assert updated.config.api.config.otlp_endpoint == old_api_config.otlp_endpoint
+    assert updated.config.api.config.otlp_headers == old_api_config.otlp_headers
+    assert updated.config.api.config.otlp_timeout == old_api_config.otlp_timeout
+
+    assert updated.config.api.config.otlp_concurrent_requests ==
+             old_api_config.otlp_concurrent_requests
+
+    assert updated.config.api.config.resource == old_api_config.resource
+    assert updated.config.api.config.otlp_compression == nil
+    refute updated.config.api.retry
+
+    assert :logger_olp.get_opts(updated.config.olp) ==
+             Map.put(old_olp_opts, :burst_limit_max_count, requested_count)
+
+    assert %{cb_state: %{max_buffer_size: 9}} = :logger_olp.info(updated.config.olp)
+
+    assert %{
+             otlp_endpoint: "http://localhost:" <> _,
+             otlp_headers: %{"authorization" => "[REDACTED]"},
+             otlp_timeout: 1_000,
+             otlp_concurrent_requests: 2,
+             retry: false,
+             resource: %{"instance.id" => "test"},
+             max_buffer_size: 9,
+             burst_limit_max_count: ^requested_count
+           } = LogHandler.filter_config(updated).config
+  end
+
+  test "Logger level updates strip stored runtime state before validation", %{bypass: bypass} do
+    id = String.to_atom("level_update_#{System.unique_integer([:positive])}")
+    Application.put_env(:otel_metric_exporter, :otlp_endpoint, "http://localhost:#{bypass.port}")
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :otlp_endpoint) end)
+
+    assert :ok =
+             :logger.add_handler(id, LogHandler, %{
+               config: %{otlp_endpoint: "http://localhost:#{bypass.port}", debounce_ms: 100}
+             })
+
+    on_exit(fn -> :logger.remove_handler(id) end)
+
+    assert :ok = :logger.update_handler_config(id, :level, :warning)
+    assert {:ok, %{level: :warning}} = :logger.get_handler_config(id)
+
+    assert :ok = :logger.set_handler_config(id, %{level: :error})
+    assert {:ok, %{level: :error}} = :logger.get_handler_config(id)
+  end
+
+  test "rejects live timeout and concurrency changes for set and update", %{bypass: bypass} do
+    id = String.to_atom("immutable_config_#{System.unique_integer([:positive])}")
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{
+        otlp_endpoint: "http://localhost:#{bypass.port}",
+        otlp_timeout: 1_000,
+        otlp_concurrent_requests: 2,
+        resource: %{instance: %{id: "test"}},
+        debounce_ms: 100,
+        max_buffer_size: 20
+      }
+    }
+
+    {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    old_olp_opts = :logger_olp.get_opts(installed.config.olp)
+    old_olp_info = :logger_olp.info(installed.config.olp)
+
+    for set_or_update <- [:set, :update], requested_timeout <- [2_000, 500] do
+      config =
+        if set_or_update == :set do
+          %{
+            otlp_endpoint: "http://localhost:#{bypass.port}",
+            otlp_timeout: requested_timeout,
+            otlp_concurrent_requests: 2
+          }
+        else
+          %{otlp_timeout: requested_timeout}
+        end
+
+      assert {:error, {:unsupported_live_otlp_timeout_change, 1_000, ^requested_timeout}} =
+               LogHandler.changing_config(set_or_update, installed, %{config: config})
+
+      assert :logger_olp.get_opts(installed.config.olp) == old_olp_opts
+      assert :logger_olp.info(installed.config.olp) == old_olp_info
+    end
+
+    for set_or_update <- [:set, :update], requested_concurrency <- [3, 1] do
+      config =
+        if set_or_update == :set do
+          %{
+            otlp_endpoint: "http://localhost:#{bypass.port}",
+            otlp_concurrent_requests: requested_concurrency,
+            otlp_timeout: 1_000
+          }
+        else
+          %{otlp_concurrent_requests: requested_concurrency}
+        end
+
+      assert {:error,
+              {:unsupported_live_otlp_concurrent_requests_change, 2, ^requested_concurrency}} =
+               LogHandler.changing_config(set_or_update, installed, %{config: config})
+
+      assert :logger_olp.get_opts(installed.config.olp) == old_olp_opts
+      assert :logger_olp.info(installed.config.olp) == old_olp_info
+    end
+  end
+
+  test "rejects live exporter changes without mutating the enabled handler", %{bypass: bypass} do
+    id = String.to_atom("immutable_exporter_#{System.unique_integer([:positive])}")
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{otlp_endpoint: "http://localhost:#{bypass.port}", debounce_ms: 100}
+    }
+
+    {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    old_olp_opts = :logger_olp.get_opts(installed.config.olp)
+    old_olp_info = :logger_olp.info(installed.config.olp)
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :none)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    for set_or_update <- [:set, :update] do
+      config =
+        if set_or_update == :set do
+          %{otlp_endpoint: "http://localhost:#{bypass.port}", logs: %{exporter: :none}}
+        else
+          %{logs: %{exporter: :none}}
+        end
+
+      assert {:error, {:unsupported_live_exporter_change, :otlp, :none}} =
+               LogHandler.changing_config(set_or_update, installed, %{config: config})
+
+      assert :logger_olp.get_opts(installed.config.olp) == old_olp_opts
+      assert :logger_olp.info(installed.config.olp) == old_olp_info
+    end
+
+    assert {:error, {:unsupported_live_exporter_change, :otlp, :none}} =
+             LogHandler.changing_config(:update, installed, %{
+               config: %{logs: [exporter: :none]}
+             })
+  end
+
+  test "rejects unsupported nested signal options instead of discarding them", %{bypass: bypass} do
+    id = String.to_atom("nested_signal_#{System.unique_integer([:positive])}")
+
+    assert {:error, %NimbleOptions.ValidationError{}} =
+             LogHandler.adding_handler(%{
+               module: LogHandler,
+               id: id,
+               config: %{
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 logs: %{otlp_endpoint: "http://localhost:9999/custom/logs"}
+               }
+             })
+
+    assert {:ok, installed} =
+             LogHandler.adding_handler(%{
+               module: LogHandler,
+               id: id,
+               config: %{otlp_endpoint: "http://localhost:#{bypass.port}"}
+             })
+
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    assert {:error, {:unsupported_nested_signal_config, [:logs]}} =
+             LogHandler.changing_config(:update, installed, %{
+               config: %{logs: %{otlp_endpoint: "http://localhost:9999/custom/logs"}}
+             })
+  end
+
+  test "ignores caller-supplied internal endpoint provenance", %{bypass: bypass} do
+    id = String.to_atom("internal_provenance_#{System.unique_integer([:positive])}")
+
+    assert {:ok, installed} =
+             LogHandler.adding_handler(%{
+               module: LogHandler,
+               id: id,
+               config: %{otlp_endpoint: "http://localhost:#{bypass.port}"}
+             })
+
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    assert {:ok, updated} =
+             LogHandler.changing_config(:update, installed, %{
+               config: %{otlp_endpoint_kind: :signal, max_buffer_size: 9}
+             })
+
+    assert updated.config.api.config.otlp_endpoint_kind == :generic
+  end
+
+  test "set resets unspecified OLP options to OTP defaults", %{bypass: bypass} do
+    id = String.to_atom("olp_set_defaults_#{System.unique_integer([:positive])}")
+
+    assert {:ok, installed} =
+             LogHandler.adding_handler(%{
+               module: LogHandler,
+               id: id,
+               config: %{
+                 otlp_endpoint: "http://localhost:#{bypass.port}",
+                 burst_limit_max_count: 99
+               }
+             })
+
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+    assert :logger_olp.get_opts(installed.config.olp).burst_limit_max_count == 99
+
+    assert {:ok, updated} =
+             LogHandler.changing_config(:set, installed, %{
+               config: %{otlp_endpoint: "http://localhost:#{bypass.port}"}
+             })
+
+    assert :logger_olp.get_opts(updated.config.olp).burst_limit_max_count ==
+             :logger_olp.get_default_opts().burst_limit_max_count
+  end
+
+  test "disabled handler has no transport processes and remains a no-op" do
+    id = String.to_atom("disabled_handler_#{System.unique_integer([:positive])}")
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :none)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{metadata: [], drop_mode_qlen: 7}
+    }
+
+    assert {:ok, installed} = LogHandler.adding_handler(handler_config)
+
+    supervisor_name = String.to_atom("Elixir.OtelMetricExporter.LogHandler_#{id}")
+    assert installed.config.api.config.exporter == :none
+    assert installed.config.drop_mode_qlen == 7
+    assert Process.whereis(supervisor_name) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_Finch")) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_TaskSupervisor")) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_logger_olp")) == nil
+
+    event = %{level: :info, msg: {:string, "disabled"}, meta: %{time: 0}}
+    assert :ok = LogHandler.log(event, installed)
+    assert :ok = LogHandler.removing_handler(installed)
+  end
+
+  test "disabled handler rejects enabling through update without starting transport" do
+    id = String.to_atom("disabled_update_#{System.unique_integer([:positive])}")
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :none)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{module: LogHandler, id: id, config: %{metadata: []}}
+    assert {:ok, installed} = LogHandler.adding_handler(handler_config)
+
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :otlp)
+
+    assert {:error, {:unsupported_live_exporter_change, :none, :otlp}} =
+             LogHandler.changing_config(:update, installed, %{
+               config: %{
+                 logs: %{exporter: :otlp},
+                 otlp_endpoint: "http://localhost:4318"
+               }
+             })
+
+    assert :ok = LogHandler.removing_handler(installed)
+  end
+
+  test "filter_config removes runtime state and redacts headers", %{bypass: bypass} do
+    api = %OtelApi{
+      finch: :placeholder_finch,
+      retry: true,
+      scope: :logs,
+      config: %Config{
+        otlp_endpoint: "http://placeholder-secret@localhost:#{bypass.port}",
+        otlp_endpoint_kind: :generic,
+        otlp_protocol: :http_protobuf,
+        otlp_headers: %{"authorization" => "placeholder-secret"},
+        otlp_timeout: 1_000,
+        exporter: :otlp,
+        resource: %{"service.name" => "placeholder"},
+        otlp_compression: :gzip,
+        otlp_concurrent_requests: 2
+      }
+    }
+
+    handler = %{
+      module: LogHandler,
+      id: :filter_config,
+      config: %{
+        api: api,
+        task_supervisor: :placeholder_task_supervisor,
+        olp: :placeholder_olp,
+        metadata: [],
+        max_buffer_size: 5
+      }
+    }
+
+    filtered = LogHandler.filter_config(handler)
+    refute Map.has_key?(filtered.config, :api)
+    refute Map.has_key?(filtered.config, :task_supervisor)
+    refute Map.has_key?(filtered.config, :olp)
+    assert filtered.config.otlp_headers == %{"authorization" => "[REDACTED]"}
+    refute filtered.config.otlp_endpoint =~ "placeholder-secret"
+    assert filtered.config.otlp_endpoint =~ "REDACTED"
+    assert handler.config.api.config.otlp_headers == %{"authorization" => "placeholder-secret"}
+  end
+
+  test "preserves signal-specific endpoint provenance during updates", %{bypass: bypass} do
+    id = String.to_atom("signal_endpoint_#{System.unique_integer([:positive])}")
+    endpoint = "http://localhost:#{bypass.port}/custom/logs"
+    Application.put_env(:otel_metric_exporter, :logs, otlp_endpoint: endpoint)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{module: LogHandler, id: id, config: %{debounce_ms: 100}}
+    assert {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    filtered = LogHandler.filter_config(installed).config
+    assert filtered.logs.otlp_endpoint == endpoint
+    refute Map.has_key?(filtered, :otlp_endpoint)
+
+    assert {:ok, updated} =
+             LogHandler.changing_config(:update, installed, %{config: %{max_buffer_size: 9}})
+
+    assert updated.config.api.config.otlp_endpoint == endpoint
+    assert updated.config.api.config.otlp_endpoint_kind == :signal
+    assert LogHandler.filter_config(updated).config.logs.otlp_endpoint == endpoint
+  end
+
+  test "partial updates retain installed signal config when application defaults drift", %{
+    bypass: bypass
+  } do
+    id = String.to_atom("signal_default_drift_#{System.unique_integer([:positive])}")
+    old_endpoint = "http://localhost:#{bypass.port}/old/logs"
+    Application.put_env(:otel_metric_exporter, :logs, otlp_endpoint: old_endpoint)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{module: LogHandler, id: id, config: %{max_buffer_size: 20}}
+    assert {:ok, installed} = LogHandler.adding_handler(handler_config)
+    on_exit(fn -> LogHandler.removing_handler(installed) end)
+
+    Application.put_env(:otel_metric_exporter, :logs,
+      otlp_endpoint: "http://localhost:#{bypass.port}/new/logs",
+      exporter: :none
+    )
+
+    assert {:ok, updated} =
+             LogHandler.changing_config(:update, installed, %{config: %{max_buffer_size: 9}})
+
+    assert updated.config.max_buffer_size == 9
+    assert updated.config.api.config.exporter == :otlp
+    assert updated.config.api.config.otlp_endpoint == old_endpoint
+    assert updated.config.api.config.otlp_endpoint_kind == :signal
+    assert LogHandler.filter_config(updated).config.logs.otlp_endpoint == old_endpoint
+  end
+
+  test "disabled handler validates overload option types without starting machinery" do
+    id = String.to_atom("disabled_invalid_olp_type_#{System.unique_integer([:positive])}")
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :none)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{
+      module: LogHandler,
+      id: id,
+      config: %{burst_limit_enable: :invalid}
+    }
+
+    assert {:error, {:invalid_olp_config, %{burst_limit_enable: :invalid}}} =
+             LogHandler.adding_handler(handler_config)
+
+    refute_disabled_handler_processes(id)
+  end
+
+  test "disabled handler validates overload levels without starting machinery" do
+    id = String.to_atom("disabled_invalid_olp_levels_#{System.unique_integer([:positive])}")
+    Application.put_env(:otel_metric_exporter, :logs, exporter: :none)
+
+    on_exit(fn -> Application.delete_env(:otel_metric_exporter, :logs) end)
+
+    handler_config = %{module: LogHandler, id: id, config: %{drop_mode_qlen: 1}}
+
+    assert {:error,
+            {:invalid_olp_levels, %{sync_mode_qlen: 1, drop_mode_qlen: 1, flush_qlen: 1_000}}} =
+             LogHandler.adding_handler(handler_config)
+
+    refute_disabled_handler_processes(id)
+  end
+
   test "removing_handler flushes queued logs under its configured allowance", %{
     bypass: bypass,
     config: initial_config
@@ -511,5 +978,13 @@ defmodule OtelMetricExporter.LogHandlerSupervisorTest do
 
   defp assert_supervisor_stopped(supervisor_ref, supervisor_pid) do
     assert_receive {:DOWN, ^supervisor_ref, :process, ^supervisor_pid, _reason}, 5_000
+  end
+
+  defp refute_disabled_handler_processes(id) do
+    supervisor_name = String.to_atom("Elixir.OtelMetricExporter.LogHandler_#{id}")
+    assert Process.whereis(supervisor_name) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_Finch")) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_TaskSupervisor")) == nil
+    assert Process.whereis(String.to_atom("#{supervisor_name}_logger_olp")) == nil
   end
 end

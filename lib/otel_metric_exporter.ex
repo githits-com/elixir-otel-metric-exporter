@@ -119,12 +119,19 @@ defmodule OtelMetricExporter do
 
   @impl true
   def init(config) do
-    children = [
-      {MetricStore, config},
-      {TelemetryHandlers, config}
-    ]
+    case MetricStore.prepare_config(config) do
+      {:ok, prepared_config} ->
+        children =
+          case prepared_config.api.config.exporter do
+            :none -> []
+            :otlp -> [{MetricStore, {:prepared, prepared_config}}, {TelemetryHandlers, config}]
+          end
 
-    Supervisor.init(children, strategy: :rest_for_one)
+        Supervisor.init(children, strategy: :rest_for_one)
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
   end
 
   @doc false

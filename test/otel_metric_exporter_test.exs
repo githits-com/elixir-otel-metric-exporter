@@ -67,6 +67,27 @@ defmodule OtelMetricExporterTest do
 
       refute log =~ secret
     end
+
+    test "does not start metric machinery when the metrics exporter is disabled" do
+      name = String.to_atom("otel_metric_exporter_disabled_#{System.unique_integer([:positive])}")
+      Application.put_env(:otel_metric_exporter, :metrics, exporter: :none)
+
+      on_exit(fn -> Application.delete_env(:otel_metric_exporter, :metrics) end)
+
+      metrics = [Metrics.counter("disabled.counter")]
+
+      assert pid =
+               start_link_supervised!(
+                 {OtelMetricExporter,
+                  @base_config |> Keyword.put(:name, name) |> Keyword.put(:metrics, metrics)}
+               )
+
+      assert Process.alive?(pid)
+      assert Supervisor.which_children(pid) == []
+      assert Process.whereis(name) == nil
+      assert Process.whereis(:"#{name}:TelemetryHandlers") == nil
+      assert :ets.whereis(name) == :undefined
+    end
   end
 
   describe "telemetry integration" do

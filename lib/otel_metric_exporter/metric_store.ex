@@ -29,7 +29,7 @@ defmodule OtelMetricExporter.MetricStore do
 
     @type t :: %__MODULE__{
             config: map(),
-            api: struct(),
+            api: %OtelApi{},
             metrics: list(),
             metrics_table: atom(),
             generations_table: :ets.tid(),
@@ -37,8 +37,38 @@ defmodule OtelMetricExporter.MetricStore do
           }
   end
 
+  @type raw_config :: %{
+          required(:name) => atom(),
+          required(:export_period) => pos_integer(),
+          optional(atom()) => term()
+        }
+
+  @type prepared_config :: %{
+          required(:config) => map(),
+          required(:api) => %OtelApi{}
+        }
+
+  @type prepared_start :: {:prepared, prepared_config()}
+  @type start_arg :: raw_config() | prepared_start()
+
   @doc false
   def default_buckets, do: @default_buckets
+
+  @doc false
+  # Resolves the metrics API once before enabled MetricStore state is created.
+  @spec prepare_config(raw_config()) :: {:ok, prepared_config()} | {:error, term()}
+  def prepare_config(config) do
+    finch_pool = Map.get(config, :finch_pool, OtelMetricExporter.Finch)
+
+    with {:ok, api, config} <- OtelApi.new(Map.put(config, :finch, finch_pool), :metrics) do
+      {:ok, %{config: config, api: api}}
+    end
+  end
+
+  @spec start_link(start_arg()) :: GenServer.on_start()
+  def start_link({:prepared, %{config: config, api: %OtelApi{}}} = prepared_arg) do
+    GenServer.start_link(__MODULE__, prepared_arg, name: config.name)
+  end
 
   def start_link(config) do
     GenServer.start_link(__MODULE__, config, name: config.name)
@@ -162,10 +192,26 @@ defmodule OtelMetricExporter.MetricStore do
   end
 
   @impl true
+  def init({:prepared, %{config: config, api: api}}) do
+    init_enabled(config, api)
+  end
+
   def init(config) do
+    case prepare_config(config) do
+      {:ok, %{config: config, api: api}} ->
+        case api.config.exporter do
+          :none -> :ignore
+          :otlp -> init_enabled(config, api)
+        end
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
+  defp init_enabled(config, api) do
     metrics = Map.get(config, :metrics, [])
     metrics_table = config.name
-    finch_pool = Map.get(config, :finch_pool, OtelMetricExporter.Finch)
     Process.send_after(self(), :export, config.export_period)
 
     # Create ETS table for metrics
@@ -175,16 +221,14 @@ defmodule OtelMetricExporter.MetricStore do
     :ets.insert(generations_table, {0, System.system_time(:nanosecond), 0})
     :persistent_term.put(generation_key(metrics_table), 0)
 
-    with {:ok, api, config} <- OtelApi.new(Map.put(config, :finch, finch_pool), :metrics) do
-      {:ok,
-       %State{
-         config: config,
-         api: api,
-         metrics: metrics,
-         metrics_table: metrics_table,
-         generations_table: generations_table
-       }}
-    end
+    {:ok,
+     %State{
+       config: config,
+       api: api,
+       metrics: metrics,
+       metrics_table: metrics_table,
+       generations_table: generations_table
+     }}
   end
 
   @impl true

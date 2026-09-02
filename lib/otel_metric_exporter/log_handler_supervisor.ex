@@ -24,12 +24,6 @@ defmodule OtelMetricExporter.LogHandlerSupervisor do
   def shutdown_timeout(%{api: %{config: %{otlp_timeout: timeout}}}),
     do: timeout + @otp_cleanup_grace
 
-  def fill_accumulator_config(accumulator_config, base_name) do
-    accumulator_config
-    |> Map.put(:finch, :"#{base_name}_Finch")
-    |> Map.put(:task_supervisor, :"#{base_name}_TaskSupervisor")
-  end
-
   def start_link(args) do
     base_name = args[:name]
 
@@ -43,14 +37,23 @@ defmodule OtelMetricExporter.LogHandlerSupervisor do
         args[:olp_config]
       )
 
-    with {:ok, sup_pid} <- Supervisor.start_link(__MODULE__, accumulator_config, name: base_name),
-         {:ok, _, olp} <- Supervisor.start_child(sup_pid, olp_child_spec) do
-      {:ok, sup_pid, olp}
-    else
+    case Supervisor.start_link(__MODULE__, accumulator_config, name: base_name) do
+      {:ok, sup_pid} -> start_olp_child(sup_pid, olp_child_spec)
+      error -> error
+    end
+  end
+
+  defp start_olp_child(sup_pid, olp_child_spec) do
+    case Supervisor.start_child(sup_pid, olp_child_spec) do
+      {:ok, _, olp} ->
+        {:ok, sup_pid, olp}
+
       {:error, {reason, child}} when is_tuple(child) and elem(child, 0) == :child ->
+        :ok = Supervisor.stop(sup_pid)
         {:error, reason}
 
       error ->
+        :ok = Supervisor.stop(sup_pid)
         error
     end
   end
