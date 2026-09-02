@@ -14,6 +14,7 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
   @name :metric_store_test
   @default_buckets [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
+  @response_cap 4_194_304
 
   setup do
     bypass = Bypass.open()
@@ -243,6 +244,7 @@ defmodule OtelMetricExporter.MetricStoreTest do
       assert MetricStore.get_metrics(@name, 0) == metrics
     end
 
+    @tag :capture_log
     test "normalizes an export worker exit and retains attempted metrics", %{store_config: config} do
       metric = Metrics.sum("test.sum")
 
@@ -266,6 +268,7 @@ defmodule OtelMetricExporter.MetricStoreTest do
       refute log =~ "test.sum"
     end
 
+    @tag :capture_log
     test "kills an overdue export worker and retains attempted metrics", %{
       bypass: bypass,
       store_config: config
@@ -363,6 +366,37 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
       state = :sys.get_state(@name)
       assert :ets.info(state.generations_table, :size) == 1
+    end
+
+    @tag :otlp_response_cap
+    test "clears metrics and preserves the store after an oversized response", %{
+      bypass: bypass,
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      tags = %{test: "value"}
+
+      store_pid =
+        start_supervised!({MetricStore, %{config | metrics: [metric], export_period: 60_000}})
+
+      Bypass.expect_once(bypass, "POST", "/v1/metrics", fn conn ->
+        Plug.Conn.resp(conn, 200, :binary.copy("x", @response_cap + 1))
+      end)
+
+      MetricStore.write_metric(@name, metric, 1, tags)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :terminal, :response_too_large} = MetricStore.export_sync(@name)
+        end)
+
+      assert log =~ "Failed to export metrics"
+      assert log =~ "disposition=terminal"
+      assert log =~ "reason=response_too_large"
+      refute log =~ String.duplicate("x", 32)
+      assert Process.alive?(store_pid)
+      assert MetricStore.get_metrics(@name, 0) == %{}
+      assert MetricStore.get_metrics(@name, 1) == %{}
     end
 
     test "preserves metrics across generations on failed exports", %{

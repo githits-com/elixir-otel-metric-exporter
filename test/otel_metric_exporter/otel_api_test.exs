@@ -16,6 +16,8 @@ defmodule OtelMetricExporter.OtelApiTest do
   alias OtelMetricExporter.OtelApi.Config
   alias OtelMetricExporter.Opentelemetry.Proto.Metrics.V1.Metric
 
+  @response_cap 4_194_304
+
   setup do
     on_exit(fn ->
       System.delete_env("OTEL_SERVICE_NAME")
@@ -697,6 +699,45 @@ defmodule OtelMetricExporter.OtelApiTest do
              )
 
     assert {:error, :terminal, :invalid_response} = OtelApi.send_metrics(api, [])
+  end
+
+  @tag :otlp_response_cap
+  test "bounds response bodies and keeps the HTTP/1 pool usable" do
+    bypass = Bypass.open()
+    endpoint = "http://localhost:#{bypass.port}"
+    {:ok, _} = start_supervised({Finch, name: ResponseCapFinch, pools: %{endpoint => [size: 1]}})
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      attempt = Agent.get_and_update(attempts, fn count -> {count + 1, count + 1} end)
+
+      case attempt do
+        1 ->
+          body = <<10, 1, 255>> <> :binary.copy("x", @response_cap - 3)
+          Plug.Conn.resp(conn, 200, body)
+
+        2 ->
+          Plug.Conn.resp(conn, 200, :binary.copy("x", @response_cap + 1))
+
+        3 ->
+          Plug.Conn.resp(conn, 503, :binary.copy("x", @response_cap + 1))
+
+        4 ->
+          Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    assert {:ok, api, %{}} =
+             OtelApi.new(
+               %{finch: ResponseCapFinch, otlp_endpoint: endpoint, retry: false},
+               :logs
+             )
+
+    assert {:error, :terminal, :invalid_response} = OtelApi.send_log_events(api, [])
+    assert {:error, :terminal, :response_too_large} = OtelApi.send_log_events(api, [])
+    assert {:error, :retryable, {:http_status, 503}} = OtelApi.send_log_events(api, [])
+    assert :ok = OtelApi.send_log_events(api, [])
+    assert Agent.get(attempts, & &1) == 4
   end
 
   test "returns invalid response for a JSON log response without retrying" do

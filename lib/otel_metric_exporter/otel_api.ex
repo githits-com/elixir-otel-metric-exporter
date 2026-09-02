@@ -24,6 +24,7 @@ defmodule OtelMetricExporter.OtelApi do
           | :transport_failure
           | :request_failed
           | :export_task_failed
+          | :response_too_large
           | {:http_status, non_neg_integer()}
   @type failure_disposition :: :terminal | :retryable
   @type export_result ::
@@ -32,6 +33,7 @@ defmodule OtelMetricExporter.OtelApi do
           | {:error, failure_disposition(), failure_reason()}
 
   @retry_initial_delay 1_000
+  @max_response_body_bytes 4_194_304
   @transient_statuses [429, 502, 503, 504]
   @finch_checkout_timeout_prefix "Finch was unable to provide a connection within the timeout"
 
@@ -200,23 +202,26 @@ defmodule OtelMetricExporter.OtelApi do
     case remaining_timeout(deadline) do
       timeout when is_integer(timeout) ->
         try do
-          Finch.request(
+          Finch.stream_while(
             request,
             finch_pool,
+            response_accumulator(),
+            &stream_response/2,
             pool_timeout: timeout,
             receive_timeout: timeout,
             request_timeout: timeout
           )
+          |> normalize_stream_response()
         rescue
           error in RuntimeError ->
             if checkout_timeout?(error) do
-              {:error, :pool_timeout}
+              {:error, :retryable, :pool_timeout}
             else
-              {:error, :request_failed}
+              {:error, :retryable, :request_failed}
             end
         catch
           _kind, _reason ->
-            {:error, :request_failed}
+            {:error, :retryable, :request_failed}
         end
 
       :expired ->
@@ -224,13 +229,51 @@ defmodule OtelMetricExporter.OtelApi do
     end
   end
 
+  defp response_accumulator do
+    %{status: nil, body: [], bytes: 0, overflow: false}
+  end
+
+  defp stream_response({:status, status}, response),
+    do: {:cont, %{response | status: status}}
+
+  defp stream_response({:data, data}, %{status: 200, bytes: bytes} = response) do
+    total_bytes = bytes + byte_size(data)
+
+    if total_bytes > @max_response_body_bytes do
+      {:halt, %{response | body: [], bytes: 0, overflow: true}}
+    else
+      {:cont, %{response | body: [data | response.body], bytes: total_bytes}}
+    end
+  end
+
+  # Non-200 responses are classified from their status only. Their bodies are
+  # consumed by Finch without retaining receiver content in the exporter.
+  defp stream_response({:data, _data}, response), do: {:cont, response}
+
+  defp stream_response(_entry, response), do: {:cont, response}
+
+  defp normalize_stream_response({:ok, %{status: 200, overflow: true}}),
+    do: {:error, :terminal, :response_too_large}
+
+  defp normalize_stream_response({:ok, %{status: 200, body: body}}),
+    do: {:ok, body |> Enum.reverse() |> IO.iodata_to_binary()}
+
+  defp normalize_stream_response({:ok, %{status: status}}) when status in @transient_statuses,
+    do: {:error, :retryable, {:http_status, status}}
+
+  defp normalize_stream_response({:ok, %{status: status}}),
+    do: {:error, :terminal, {:http_status, status}}
+
+  defp normalize_stream_response({:error, _reason, _response}),
+    do: {:error, :retryable, :transport_failure}
+
   defp await_finch_request(request_ref, worker_pid, monitor_ref, deadline) do
     case remaining_timeout(deadline) do
       timeout when is_integer(timeout) ->
         receive do
           {^request_ref, result} ->
             Process.demonitor(monitor_ref, [:flush])
-            normalize_finch_response(result)
+            result
 
           {:DOWN, ^monitor_ref, :process, ^worker_pid, _reason} ->
             {:error, :retryable, :request_failed}
@@ -264,26 +307,6 @@ defmodule OtelMetricExporter.OtelApi do
       0 -> :ok
     end
   end
-
-  defp normalize_finch_response({:ok, %{status: 200, body: body}}), do: {:ok, body}
-
-  defp normalize_finch_response({:ok, %{status: status}}) when status in @transient_statuses,
-    do: {:error, :retryable, {:http_status, status}}
-
-  defp normalize_finch_response({:ok, %{status: status}}),
-    do: {:error, :terminal, {:http_status, status}}
-
-  defp normalize_finch_response({:error, :pool_timeout}),
-    do: {:error, :retryable, :pool_timeout}
-
-  defp normalize_finch_response({:error, :request_failed}),
-    do: {:error, :retryable, :request_failed}
-
-  defp normalize_finch_response({:error, :retryable, :deadline_exceeded}),
-    do: {:error, :retryable, :deadline_exceeded}
-
-  defp normalize_finch_response({:error, _reason}),
-    do: {:error, :retryable, :transport_failure}
 
   defp checkout_timeout?(%RuntimeError{message: message}),
     do: String.starts_with?(message, @finch_checkout_timeout_prefix)

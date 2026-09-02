@@ -373,6 +373,7 @@ defmodule OtelMetricExporter.MetricStore do
   defp format_failure_reason(:transport_failure), do: "transport_failure"
   defp format_failure_reason(:request_failed), do: "request_failed"
   defp format_failure_reason(:export_task_failed), do: "export_task_failed"
+  defp format_failure_reason(:response_too_large), do: "response_too_large"
 
   defp format_failure_reason({:http_status, status}),
     do: "http_status=#{Integer.to_string(status)}"
