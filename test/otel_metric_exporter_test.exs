@@ -44,6 +44,51 @@ defmodule OtelMetricExporterTest do
       assert {:error, _} = OtelMetricExporter.start_link(otlp_protocol: :invalid)
     end
 
+    test "validates aggregation temporality and defaults to cumulative" do
+      [metric] = [Metrics.counter("test.counter")]
+      metrics = [metric]
+
+      assert is_pid(
+               start_link_supervised!({OtelMetricExporter, @base_config ++ [metrics: metrics]})
+             )
+
+      assert %{
+               aggregation_temporality: :cumulative,
+               metric_lookup: %{{:counter, "test.counter"} => ^metric}
+             } = :sys.get_state(@name)
+    end
+
+    test "rejects invalid aggregation temporality" do
+      metrics = [Metrics.counter("test.counter")]
+
+      assert {:error, error} =
+               OtelMetricExporter.start_link(
+                 @base_config ++ [metrics: metrics, aggregation_temporality: :invalid]
+               )
+
+      assert error.key == :aggregation_temporality
+    end
+
+    test "rejects unsupported metric types at the public configuration boundary" do
+      metrics = [Metrics.summary("test.summary")]
+
+      assert {:error, error} = OtelMetricExporter.start_link(@base_config ++ [metrics: metrics])
+      assert error.key == :metrics
+    end
+
+    test "metric lookup preserves the first configured definition for duplicate keys" do
+      first = Metrics.sum("test.sum", description: "first")
+      second = Metrics.sum("test.sum", description: "second")
+
+      assert is_pid(
+               start_link_supervised!(
+                 {OtelMetricExporter, @base_config ++ [metrics: [first, second]]}
+               )
+             )
+
+      assert %{metric_lookup: %{{:sum, "test.sum"} => ^first}} = :sys.get_state(@name)
+    end
+
     test "redacts invalid header values from start_link errors" do
       secret = "top-level-header-secret"
       metrics = [Metrics.counter("test.counter")]
@@ -79,7 +124,10 @@ defmodule OtelMetricExporterTest do
       assert pid =
                start_link_supervised!(
                  {OtelMetricExporter,
-                  @base_config |> Keyword.put(:name, name) |> Keyword.put(:metrics, metrics)}
+                  @base_config
+                  |> Keyword.put(:name, name)
+                  |> Keyword.put(:metrics, metrics)
+                  |> Keyword.put(:aggregation_temporality, :delta)}
                )
 
       assert Process.alive?(pid)
@@ -159,6 +207,34 @@ defmodule OtelMetricExporterTest do
 
       assert get_in(metrics, [{:sum, "test.measured_with_metadata"}, %{test: "value"}]) ==
                63
+    end
+
+    test "skips missing distribution measurements without detaching the handler" do
+      event = [:test, :missing_distribution]
+
+      metrics = [
+        Metrics.distribution("test.distribution", event_name: event, measurement: :value),
+        Metrics.counter("test.counter", event_name: event)
+      ]
+
+      exporter = start_supervised!({OtelMetricExporter, @base_config ++ [metrics: metrics]})
+
+      :telemetry.execute(event, %{}, %{})
+      :telemetry.execute(event, %{value: 3}, %{})
+
+      assert Process.alive?(exporter)
+      assert :telemetry.list_handlers(event) != []
+
+      assert get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
+               {:counter, "test.counter"},
+               %{}
+             ]) == 2
+
+      assert get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
+               {:distribution, "test.distribution"},
+               %{},
+               1
+             ]) == {1, 3}
     end
 
     test "handles tag functions" do

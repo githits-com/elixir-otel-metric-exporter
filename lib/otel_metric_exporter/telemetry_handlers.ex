@@ -32,11 +32,16 @@ defmodule OtelMetricExporter.TelemetryHandlers do
     |> Enum.map(fn {event_name, metrics} ->
       handler_id = {__MODULE__, config.name, event_name}
 
+      metrics_with_names =
+        Enum.map(metrics, fn metric ->
+          {metric, OtelMetricExporter.metric_name_string(metric)}
+        end)
+
       :telemetry.attach(
         handler_id,
         event_name,
         &OtelMetricExporter.handle_metric/4,
-        %{metrics: metrics, name: config.name, handler_id: handler_id}
+        %{metrics: metrics_with_names, name: config.name, handler_id: handler_id}
       )
 
       handler_id

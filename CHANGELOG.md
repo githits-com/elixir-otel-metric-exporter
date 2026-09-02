@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add bounded completion telemetry for log and metric export batches.
 - Make disabled exporters inert and reject live log transport changes that
   would invalidate their startup resources.
+- Add configurable cumulative or delta aggregation temporality for metric
+  sums, counters, and histograms.
+- Skip non-numeric distribution measurements, bound retained failed metric
+  generations, and correct Gauge timestamps for Datadog receivers.
+- Precompute metric names and export lookup data during setup.
 
 ## [0.3.6] - 2025-04-08
 

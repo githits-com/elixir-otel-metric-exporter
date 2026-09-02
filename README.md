@@ -38,7 +38,10 @@ the bounded `outcome` atom. No endpoint, headers, response content, or error
 terms are included.
 
 For logs, a final failure drops the full batch. For metrics, a terminal failure
-drops the full data-point batch, while a retryable failure retains it. Partial
+drops the full data-point batch, while a retryable failure retains it. At most
+ten completed metric generations are retained; pruning older generations emits
+a warning with the generation count in structured metadata. The `dropped_items`
+measurement covers terminal batch loss, not retention-bound pruning. Partial
 success reports rejected items separately and does not count them as dropped.
 
 ## Configuration changes
@@ -61,3 +64,11 @@ handler again before retrying the change.
 Logger `:set` operations rebuild handler configuration from application and
 environment defaults; values supplied only when the handler was first added
 must be supplied again or moved into those defaults.
+
+## Metric aggregation temporality
+
+Metric sums, counters, and histograms are encoded with cumulative OTLP
+aggregation temporality by default for compatibility. Configure
+`aggregation_temporality: :delta` for receivers that expect delta intervals,
+such as Datadog. Gauges are point-in-time values and are unaffected by this
+option.

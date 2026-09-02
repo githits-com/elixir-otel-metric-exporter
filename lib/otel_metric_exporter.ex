@@ -64,6 +64,15 @@ defmodule OtelMetricExporter do
                         default: :otel_metric_exporter,
                         doc:
                           "If you require multiple exporters, give each exporter a unique name."
+                      ],
+                      aggregation_temporality: [
+                        type: {:in, [:cumulative, :delta]},
+                        default: :cumulative,
+                        doc:
+                          "OTLP aggregation temporality for exported metrics. " <>
+                            "Use :delta for backends that expect delta semantics (e.g. Datadog). " <>
+                            "The default :cumulative value preserves the existing wire encoding. " <>
+                            "Gauges (LastValue) are unaffected as they have no temporality."
                       ]
                     ] ++ OtelApi.public_options()
                   )
@@ -140,12 +149,11 @@ defmodule OtelMetricExporter do
         name: name,
         handler_id: handler_id
       }) do
-    for metric <- metrics do
+    for {metric, metric_name} <- metrics do
       if is_nil(metric.keep) || metric.keep.(metadata) do
         value = extract_measurement(metric, measurements, metadata)
         tags = extract_tags(metric, metadata)
 
-        metric_name = "#{Enum.join(metric.name, ".")}"
         MetricStore.write_metric(name, metric, metric_name, value, tags)
       end
     end
@@ -173,4 +181,8 @@ defmodule OtelMetricExporter do
     |> metric.tag_values.()
     |> Map.take(metric.tags)
   end
+
+  @doc false
+  @spec metric_name_string(Metrics.t()) :: String.t()
+  def metric_name_string(metric), do: Enum.join(metric.name, ".")
 end
