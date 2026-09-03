@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Emit bounded telemetry before preserving a Logger callback failure so handler
+  removal can be diagnosed without exposing log or transport data.
 - Add bounded completion telemetry for log and metric export batches.
 - Make disabled exporters inert and reject live log transport changes that
   would invalidate their startup resources.
