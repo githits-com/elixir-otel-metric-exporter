@@ -44,6 +44,17 @@ a warning with the generation count in structured metadata. The `dropped_items`
 measurement covers terminal batch loss, not retention-bound pruning. Partial
 success reports rejected items separately and does not count them as dropped.
 
+If the Logger callback raises, exits, or throws while preparing or loading a log
+event, the handler emits `[:otel_metric_exporter, :log_handler, :exception]`
+before preserving the original failure. Its sole measurement is `count: 1`.
+Metadata contains only fixed classifications: `stage` (`olp_liveness`,
+`prepare`, `load`, or `handler`), `failure_source` (`trace_context`, `body`,
+`attributes`, `protocol`, `olp`, `handler`, or `unknown`), `exception`,
+`message_shape`, `trace_context` (`valid`, `missing`, `partial`, or `invalid`),
+and the boolean `olp_alive`. The module types enumerate the exception and
+message-shape values. It never includes the log event, Logger metadata,
+exception reason, stacktrace, endpoint, headers, or response content.
+
 ## Configuration changes
 
 The log handler resolves its exporter, timeout, and concurrency settings when it

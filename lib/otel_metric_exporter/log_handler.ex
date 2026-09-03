@@ -39,6 +39,7 @@ defmodule OtelMetricExporter.LogHandler do
   """
 
   alias OtelMetricExporter.LogAccumulator
+  alias OtelMetricExporter.LogHandlerFailureTelemetry
   alias OtelMetricExporter.LogHandlerSupervisor
 
   @behaviour :logger_handler
@@ -284,8 +285,17 @@ defmodule OtelMetricExporter.LogHandler do
   def log(_event, %{config: %{api: %{config: %{exporter: :none}}}}), do: :ok
 
   def log(event, %{config: %{olp: olp} = config}) do
-    true = Process.alive?(:logger_olp.get_pid(olp))
-    :logger_olp.load(olp, LogAccumulator.prepare_log_event(event, config))
+    olp_pid = :logger_olp.get_pid(olp)
+
+    try do
+      true = Process.alive?(olp_pid)
+      :logger_olp.load(olp, LogAccumulator.prepare_log_event(event, config))
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+        LogHandlerFailureTelemetry.emit(event, olp_pid, kind, reason, stacktrace)
+        :erlang.raise(kind, reason, stacktrace)
+    end
   end
 
   @impl true
