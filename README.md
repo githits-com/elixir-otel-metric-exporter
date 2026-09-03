@@ -55,6 +55,11 @@ and the boolean `olp_alive`. The module types enumerate the exception and
 message-shape values. It never includes the log event, Logger metadata,
 exception reason, stacktrace, endpoint, headers, or response content.
 
+Logger report maps may use arbitrary Erlang terms as keys and values. Nested
+plain maps retain their flattened dotted-key representation, while structs and
+other scalar terms are encoded through their inspected representation. These
+valid report shapes do not detach the handler.
+
 ## Configuration changes
 
 The log handler resolves its exporter, timeout, and concurrency settings when it

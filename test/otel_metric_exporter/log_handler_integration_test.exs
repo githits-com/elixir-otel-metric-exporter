@@ -78,6 +78,38 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
     assert [%LogRecord{body: %{value: {:string_value, "hello info"}}}] = logs
   end
 
+  test "keeps the handler installed after reports with arbitrary terms", %{
+    bypass: bypass,
+    handler_id: handler_id
+  } do
+    parent = self()
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      %ExportLogsServiceRequest{resource_logs: [%{scope_logs: [%{log_records: logs}]}]} =
+        decode_request_body(body)
+
+      send(parent, {:logs, logs})
+      Plug.Conn.resp(conn, 200, "")
+    end)
+
+    uri = URI.parse("https://example.com/packages")
+    Logger.info(%{%{} => "map key", nested: uri})
+
+    assert_receive {:logs, [%LogRecord{body: %{value: {:kvlist_value, %{values: values}}}}]},
+                   500
+
+    values = Map.new(values, fn key_value -> {key_value.key, key_value.value} end)
+    assert values["nested"] == %AnyValue{value: {:string_value, inspect(uri)}}
+    assert values["%{}"] == %AnyValue{value: {:string_value, "map key"}}
+    assert {:ok, _config} = :logger.get_handler_config(handler_id)
+
+    Logger.info("after report")
+
+    assert_receive {:logs, [%LogRecord{body: %{value: {:string_value, "after report"}}}]}, 500
+  end
+
   test "captures Logger.error message with correct severity", %{bypass: bypass} do
     parent = self()
 
