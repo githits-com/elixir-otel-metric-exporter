@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Encode valid Logger report maps with nested structs or arbitrary term keys
+  without detaching the log handler.
 - Emit bounded telemetry before preserving a Logger callback failure so handler
   removal can be diagnosed without exposing log or transport data.
 - Add bounded completion telemetry for log and metric export batches.

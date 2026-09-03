@@ -18,13 +18,13 @@ defmodule OtelMetricExporter.OtlpUtils do
 
   def build_kv(tags, key_prefix \\ "") do
     Enum.flat_map(tags, fn
-      {key, value} when is_map(value) ->
-        build_kv(value, key_prefix <> to_string(key) <> ".")
+      {key, value} when is_map(value) and not is_struct(value) ->
+        build_kv(value, key_prefix <> key_to_string(key) <> ".")
 
       {key, value} ->
         [
           %KeyValue{
-            key: key_prefix <> to_string(key),
+            key: key_prefix <> key_to_string(key),
             value: %AnyValue{value: to_kv_value(value)}
           }
         ]
@@ -48,4 +48,12 @@ defmodule OtelMetricExporter.OtlpUtils do
   def to_kv_value(value) when is_tuple(value), do: to_kv_value(Tuple.to_list(value))
   def to_kv_value(value) when is_pid(value), do: to_kv_value(inspect(value))
   def to_kv_value(any), do: to_kv_value(inspect(any))
+
+  @spec key_to_string(term()) :: String.t()
+  defp key_to_string(key) do
+    case String.Chars.impl_for(key) do
+      nil -> inspect(key)
+      _implementation -> to_string(key)
+    end
+  end
 end

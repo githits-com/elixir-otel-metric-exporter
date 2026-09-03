@@ -47,14 +47,14 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
   end
 
   test "reports unsupported report bodies without copying exception details" do
-    event = log_event({:report, %{%{} => @secret}})
+    event = log_event({:report, @secret})
 
     try do
       LogHandler.log(event, handler_config({:test_olp, self(), make_ref()}))
       flunk("expected report conversion to fail")
     catch
       :error, %Protocol.UndefinedError{} ->
-        assert [{String.Chars, :impl_for!, 1, _} | _] = __STACKTRACE__
+        assert [{Enumerable, :impl_for!, 1, _} | _] = __STACKTRACE__
     end
 
     assert_receive {:handler_exception, @event, measurements, metadata}
@@ -63,7 +63,7 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
     assert metadata == %{
              exception: :protocol_undefined,
              failure_source: :body,
-             message_shape: :report_map,
+             message_shape: :report_other,
              olp_alive: true,
              stage: :prepare,
              trace_context: :missing

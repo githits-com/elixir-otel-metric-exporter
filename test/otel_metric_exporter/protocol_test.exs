@@ -37,5 +37,17 @@ defmodule OtelMetricExporter.ProtocolTest do
       assert {:bool_value, false} = OtlpUtils.to_kv_value(false)
       assert {:string_value, "normal"} = OtlpUtils.to_kv_value(:normal)
     end
+
+    test "encodes nested structs and arbitrary map keys" do
+      uri = URI.parse("https://example.com/packages")
+
+      values =
+        OtlpUtils.build_kv(%{%{} => "map key", nested: uri})
+        |> Map.new(fn key_value -> {key_value.key, key_value.value} end)
+
+      assert %{value: {:string_value, encoded_uri}} = values["nested"]
+      assert encoded_uri == inspect(uri)
+      assert %{value: {:string_value, "map key"}} = values["%{}"]
+    end
   end
 end
