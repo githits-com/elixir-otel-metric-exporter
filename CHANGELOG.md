@@ -16,8 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would invalidate their startup resources.
 - Add configurable cumulative or delta aggregation temporality for metric
   sums, counters, and histograms.
-- Skip non-numeric distribution measurements, bound retained failed metric
-  generations, and correct Gauge timestamps for Datadog receivers.
+- Correct Gauge timestamps for Datadog receivers.
+- Correct MetricStore aggregation state: delta retry retention is capped at ten
+  immutable pending intervals, reaggregated to one point per series, with
+  pruned points included in dropped-item accounting; cumulative aggregates
+  retain lifetime totals.
+- Preserve counter presence semantics, isolate invalid measurements with the
+  bounded `[:otel_metric_exporter, :metric, :measurement_dropped]` event, and
+  use ETS `update_counter` for integer sums, exact-object CAS for float sums,
+  and exact scaled-integer state for distributions.
+- Flush metrics during graceful supervised shutdown while Finch remains alive,
+  with the final-drain linearization boundary documented in the README.
+- Add the dependency-free production benchmark (`MIX_ENV=prod mix run
+  bench/metric_store_bench.exs`) for paired write-path and collection/recovery
+  verification.
 - Precompute metric names and export lookup data during setup.
 
 ## [0.3.6] - 2025-04-08
