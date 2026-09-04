@@ -43,7 +43,7 @@ defmodule OtelMetricExporter.MetricStore do
     @type interval :: %{
             start: non_neg_integer(),
             finish: non_neg_integer(),
-            aggregates: %{optional(tuple()) => non_neg_integer() | number() | map()}
+            aggregates: %{optional(tuple()) => non_neg_integer() | number() | tuple()}
           }
 
     @type t :: %__MODULE__{
@@ -121,8 +121,11 @@ defmodule OtelMetricExporter.MetricStore do
   def get_metrics(metrics_table) do
     metrics_table
     |> :ets.tab2list()
-    |> Enum.reduce(%{}, fn {{type, name, encoded_tags}, value}, acc ->
+    |> Enum.reduce(%{}, fn object, acc ->
+      {type, name, encoded_tags} = elem(object, 0)
       tags = decode_tags(encoded_tags)
+      value = object_value(type, object)
+      value = if type == :distribution, do: Aggregate.to_map(value), else: value
 
       Map.update(acc, {type, name}, %{tags => value}, fn all_tags ->
         Map.put(all_tags, tags, value)
@@ -151,7 +154,12 @@ defmodule OtelMetricExporter.MetricStore do
   def write_metric(metrics_table, %Metrics.Sum{}, string_name, value, tags)
       when is_number(value) do
     key = logical_key(:sum, string_name, tags)
-    cas_update(metrics_table, key, value, &Aggregate.add(:sum, &1, value))
+
+    if is_integer(value) do
+      add_integer_sum(metrics_table, key, value)
+    else
+      cas_update(metrics_table, key, value, &Aggregate.add(:sum, &1, value))
+    end
   end
 
   def write_metric(_metrics_table, %Metrics.Sum{}, _string_name, _value, _tags), do: :ok
@@ -170,14 +178,9 @@ defmodule OtelMetricExporter.MetricStore do
     bucket_bounds = Keyword.get(metric.reporter_options, :buckets, @default_buckets)
     bucket = find_bucket(bucket_bounds, value)
     key = logical_key(:distribution, string_name, tags)
-    initial = Aggregate.new(:distribution, value, bucket, length(bucket_bounds) + 1)
-
-    cas_update(
-      metrics_table,
-      key,
-      initial,
-      &Aggregate.add(:distribution, &1, value, bucket)
-    )
+    scaled = Aggregate.encode(value)
+    operations = Aggregate.distribution_update_ops(scaled, bucket)
+    add_distribution(metrics_table, key, operations, scaled, bucket, length(bucket_bounds) + 1)
   end
 
   def write_metric(_metrics_table, %Metrics.Distribution{}, _string_name, _value, _tags),
@@ -217,6 +220,58 @@ defmodule OtelMetricExporter.MetricStore do
     end
   end
 
+  defp add_integer_sum(metrics_table, key, value) do
+    try do
+      :ets.update_counter(metrics_table, key, {2, value}, {key, 0})
+      :ok
+    rescue
+      ArgumentError ->
+        cas_update(metrics_table, key, value, &Aggregate.add(:sum, &1, value))
+    end
+  end
+
+  defp add_distribution(metrics_table, key, operations, scaled, bucket, bucket_count) do
+    try do
+      :ets.update_counter(metrics_table, key, operations)
+      :ok
+    rescue
+      ArgumentError ->
+        initial = Aggregate.new_scaled(scaled, bucket, bucket_count)
+        add_distribution_after_missing(metrics_table, key, operations, initial)
+    end
+  end
+
+  defp add_distribution_after_missing(metrics_table, key, operations, initial) do
+    object = Aggregate.object(key, initial)
+
+    if :ets.insert_new(metrics_table, object) do
+      :ok
+    else
+      # A failed insert proves another writer has created the row; retry the
+      # atomic update against that competing row without a bounded fallback.
+      try do
+        :ets.update_counter(metrics_table, key, operations)
+        :ok
+      rescue
+        error in ArgumentError ->
+          case :ets.lookup(metrics_table, key) do
+            [] ->
+              # The competing row was removed between the update and this
+              # lookup; retry only after verifying that absence.
+              add_distribution_after_missing(metrics_table, key, operations, initial)
+
+            [_object] ->
+              # ETS :set lookup proves a present object owns this key; any
+              # update error therefore indicates an incompatible row.
+              reraise error, __STACKTRACE__
+          end
+      end
+    end
+  end
+
+  defp object_value(:distribution, object), do: Aggregate.row(object)
+  defp object_value(_type, object), do: elem(object, 1)
+
   defp find_bucket(bucket_bounds, value) do
     case Enum.find_index(bucket_bounds, &(value <= &1)) do
       # Overflow bucket
@@ -225,6 +280,11 @@ defmodule OtelMetricExporter.MetricStore do
     end
   end
 
+  # Direct-key operations preserve raw tag maps; only sums need map-free keys
+  # because their CAS match specs embed the key literally.
+  defp logical_key(type, name, tags) when type in [:counter, :last_value, :distribution],
+    do: {type, name, tags}
+
   defp logical_key(type, name, tags), do: {type, name, canonical_tags(tags)}
 
   # Keep the internal key component free of maps so it can be embedded as a
@@ -232,9 +292,8 @@ defmodule OtelMetricExporter.MetricStore do
   # exact tag map while remaining separate from external identifiers.
   defp canonical_tags(tags), do: :erlang.term_to_binary(tags, [:deterministic])
 
-  defp decode_tags(encoded_tags) do
-    :erlang.binary_to_term(encoded_tags)
-  end
+  defp decode_tags(tags) when is_map(tags), do: tags
+  defp decode_tags(encoded_tags), do: :erlang.binary_to_term(encoded_tags)
 
   @impl true
   def init({:prepared, %{config: config, api: api}}) do
@@ -389,12 +448,12 @@ defmodule OtelMetricExporter.MetricStore do
   defp collect(%State{aggregation_temporality: :delta} = state) do
     finish = System.system_time(:nanosecond)
 
-    keys = :ets.select(state.metrics_table, [{{:"$1", :_}, [], [:"$1"]}])
+    keys = :ets.select(state.metrics_table, [{:_, [], [{:element, 1, :"$_"}]}])
 
     aggregates =
       Enum.reduce(keys, %{}, fn key, acc ->
         case :ets.take(state.metrics_table, key) do
-          [{^key, value}] -> Map.put(acc, key, value)
+          [object] -> Map.put(acc, key, object_value(elem(key, 0), object))
           [] -> acc
         end
       end)
@@ -409,7 +468,10 @@ defmodule OtelMetricExporter.MetricStore do
     aggregates =
       state.metrics_table
       |> :ets.tab2list()
-      |> Map.new()
+      |> Map.new(fn object ->
+        key = elem(object, 0)
+        {key, object_value(elem(key, 0), object)}
+      end)
 
     interval = %{start: state.started_at, finish: finish, aggregates: aggregates}
     {interval, %{state | last_collection: finish}}
@@ -664,12 +726,12 @@ defmodule OtelMetricExporter.MetricStore do
              attributes: build_kv(tags),
              start_time_unix_nano: from,
              time_unix_nano: to,
-             count: aggregate.count,
-             sum: aggregate.sum / 1,
-             bucket_counts: aggregate.buckets,
+             count: Aggregate.count(aggregate),
+             sum: Aggregate.sum(aggregate),
+             bucket_counts: Aggregate.buckets(aggregate),
              explicit_bounds: bucket_bounds,
-             min: aggregate.min / 1,
-             max: aggregate.max / 1
+             min: Aggregate.min_value(aggregate),
+             max: Aggregate.max_value(aggregate)
            }
          end),
        aggregation_temporality: otlp_temporality(temporality)

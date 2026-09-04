@@ -4,6 +4,7 @@ defmodule OtelMetricExporter.MetricStoreTest do
   import ExUnit.CaptureLog
 
   alias OtelMetricExporter.MetricStore
+  alias OtelMetricExporter.MetricStore.Aggregate
   alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.ExportMetricsServiceRequest
 
   alias OtelMetricExporter.Opentelemetry.Proto.Collector.Metrics.V1.{
@@ -84,6 +85,102 @@ defmodule OtelMetricExporter.MetricStoreTest do
     Plug.Conn.resp(conn, status, if(status == 200, do: "", else: "Service Unavailable"))
   end
 
+  describe "exact scaled distribution arithmetic" do
+    test "encodes raw float bits and integers as exact 2^-1074 units" do
+      values = [
+        1.0,
+        float_from_bits(0x3FF0000000000001),
+        -2.5,
+        float_from_bits(0x0000000000000001),
+        float_from_bits(0x000FFFFFFFFFFFFF),
+        float_from_bits(0x0010000000000000),
+        float_from_bits(0x7FEFFFFFFFFFFFFF)
+      ]
+
+      Enum.each(values, fn value ->
+        assert Aggregate.encode(value) == reference_scaled_float(value)
+      end)
+
+      # The last ULP above one remains exact through the scaled representation.
+      last_ulp = float_from_bits(0x3FF0000000000001)
+      assert Aggregate.decode(Aggregate.encode(last_ulp)) == last_ulp
+
+      assert Aggregate.encode(3) == :erlang.bsl(3, 1074)
+      assert Aggregate.encode(-3) == -:erlang.bsl(3, 1074)
+      # Signed zero is deliberately canonicalized because the scaled integer
+      # representation has no sign bit for zero.
+      assert Aggregate.encode(float_from_bits(0x8000000000000000)) == 0
+      assert Aggregate.decode(0) == 0.0
+      assert float_bits(Aggregate.decode(0)) == 0
+    end
+
+    test "rounds exact sums to nearest ties-to-even across boundaries" do
+      one = :erlang.bsl(1, 1074)
+      ulp_at_one = :erlang.bsl(1, 1022)
+      half_ulp_at_one = :erlang.bsl(1, 1021)
+
+      assert float_bits(Aggregate.decode(one + half_ulp_at_one)) == 0x3FF0000000000000
+
+      assert float_bits(Aggregate.decode(one + ulp_at_one + half_ulp_at_one)) ==
+               0x3FF0000000000002
+
+      two = :erlang.bsl(1, 1075)
+      max_significand_below_two = :erlang.bsl(:erlang.bsl(1, 53) - 1, 1022)
+      assert Aggregate.decode(max_significand_below_two + :erlang.bsl(1, 1021)) == 2.0
+
+      max_subnormal = :erlang.bsl(1, 52) - 1
+      assert float_bits(Aggregate.decode(max_subnormal)) == 0x000FFFFFFFFFFFFF
+      assert float_bits(Aggregate.decode(:erlang.bsl(1, 52))) == 0x0010000000000000
+      assert Aggregate.decode(two) == 2.0
+    end
+
+    test "retains exact extrema, cancellation, bucket counts, and merge order" do
+      first = Aggregate.new(:distribution, -1.25, 0, 3)
+      second = Aggregate.new(:distribution, 1.25, 2, 3)
+      merged = Aggregate.merge(:distribution, first, second)
+
+      assert Aggregate.count(merged) == 2
+      assert Aggregate.sum(merged) == 0.0
+      assert Aggregate.min_value(merged) == -1.25
+      assert Aggregate.max_value(merged) == 1.25
+      assert Aggregate.buckets(merged) == [1, 0, 1]
+
+      assert Aggregate.distribution_update_ops(Aggregate.encode(2), 1) == [
+               {2, 1},
+               {3, :erlang.bsl(2, 1074)},
+               {4, 0, :erlang.bsl(2, 1074), :erlang.bsl(2, 1074)},
+               {5, 0, -:erlang.bsl(2, 1074), -:erlang.bsl(2, 1074)},
+               {7, 1}
+             ]
+    end
+
+    test "decodes the largest finite value and rejects overflow" do
+      max_finite = float_from_bits(0x7FEFFFFFFFFFFFFF)
+      max_scaled = reference_scaled_float(max_finite)
+
+      assert Aggregate.decode(max_scaled) == max_finite
+
+      assert_raise ArithmeticError, fn ->
+        Aggregate.decode(max_scaled + :erlang.bsl(1, 2044))
+      end
+    end
+  end
+
+  defp float_from_bits(bits) do
+    <<value::float-big-64>> = <<bits::unsigned-big-64>>
+    value
+  end
+
+  defp float_bits(value) do
+    <<bits::unsigned-big-64>> = <<value::float-big-64>>
+    bits
+  end
+
+  defp reference_scaled_float(value) do
+    {numerator, denominator} = Float.ratio(value)
+    numerator * div(:erlang.bsl(1, 1074), denominator)
+  end
+
   describe "stable per-series aggregation" do
     test "uses one row for each series and preserves numeric values", %{store_config: config} do
       counter = Metrics.counter("test.counter")
@@ -116,6 +213,17 @@ defmodule OtelMetricExporter.MetricStoreTest do
                buckets: [1, 1, 0]
              }
 
+      [{_key, count, scaled_sum, min_value, negated_max, bucket_zero, bucket_one, overflow}] =
+        Enum.filter(:ets.tab2list(@name), fn
+          {key, _count, _sum, _min, _max, _b0, _b1, _b2} -> elem(key, 0) == :distribution
+          _object -> false
+        end)
+
+      assert Enum.all?(
+               [count, scaled_sum, min_value, negated_max, bucket_zero, bucket_one, overflow],
+               &is_integer/1
+             )
+
       state = :sys.get_state(@name)
       assert :ets.info(state.metrics_table, :size) == 4
     end
@@ -131,6 +239,41 @@ defmodule OtelMetricExporter.MetricStoreTest do
 
       Enum.each(tasks, &Task.await(&1, 5_000))
       assert %{{:sum, "test.sum"} => %{%{} => 125.0}} = MetricStore.get_metrics(@name)
+    end
+
+    test "switches sums between integer updates and float CAS in both directions", %{
+      store_config: config
+    } do
+      metric = Metrics.sum("test.sum")
+      start_store(config, [metric])
+
+      MetricStore.write_metric(@name, metric, 0.5, %{})
+
+      float_first_tasks =
+        for _ <- 1..50 do
+          Task.async(fn ->
+            MetricStore.write_metric(@name, metric, 0.5, %{})
+            MetricStore.write_metric(@name, metric, 1, %{})
+          end)
+        end
+
+      Enum.each(float_first_tasks, &Task.await(&1, 5_000))
+      assert %{{:sum, "test.sum"} => %{%{} => 75.5}} = MetricStore.get_metrics(@name)
+
+      MetricStore.write_metric(@name, metric, 1, %{direction: "integer_first"})
+
+      integer_first_tasks =
+        for _ <- 1..50 do
+          Task.async(fn ->
+            MetricStore.write_metric(@name, metric, 1, %{direction: "integer_first"})
+            MetricStore.write_metric(@name, metric, 0.5, %{direction: "integer_first"})
+          end)
+        end
+
+      Enum.each(integer_first_tasks, &Task.await(&1, 5_000))
+
+      assert %{{:sum, "test.sum"} => sums} = MetricStore.get_metrics(@name)
+      assert sums[%{direction: "integer_first"}] == 76.0
     end
 
     test "keeps different tag sets independent", %{store_config: config} do
@@ -847,9 +990,9 @@ defmodule OtelMetricExporter.MetricStoreTest do
     active_metrics = MetricStore.get_metrics(@name)
     retained_aggregates = hd(state_after_retry.pending_intervals).aggregates
     encoded_tags = :erlang.term_to_binary(tags, [:deterministic])
-    counter_key = {:counter, "test.stress.counter", encoded_tags}
+    counter_key = {:counter, "test.stress.counter", tags}
     sum_key = {:sum, "test.stress.sum", encoded_tags}
-    histogram_key = {:distribution, "test.stress.histogram", encoded_tags}
+    histogram_key = {:distribution, "test.stress.histogram", tags}
 
     retained_counter =
       Map.get(retained_aggregates, counter_key, 0)
@@ -873,7 +1016,14 @@ defmodule OtelMetricExporter.MetricStoreTest do
       |> Map.get({:distribution, "test.stress.histogram"}, %{})
       |> Map.get(tags)
 
-    present_histograms = Enum.filter([retained_histogram, active_histogram], &is_map/1)
+    present_histograms =
+      [retained_histogram, active_histogram]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(fn
+        row when is_tuple(row) -> Aggregate.to_map(row)
+        row -> row
+      end)
+
     assert present_histograms != []
 
     Enum.each(present_histograms, fn aggregate ->
