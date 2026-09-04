@@ -255,7 +255,7 @@ defmodule OtelMetricExporterTest do
                %{}
              ]) == 1
 
-      assert %{count: 1, sum: 3, min: 3, max: 3, buckets: [0, 1 | _]} =
+      assert %{count: 1, sum: 3.0, min: 3.0, max: 3.0, buckets: [0, 1 | _]} =
                get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
                  {:distribution, "test.distribution"},
                  %{}
