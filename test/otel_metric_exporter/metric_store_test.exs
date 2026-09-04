@@ -59,7 +59,9 @@ defmodule OtelMetricExporter.MetricStoreTest do
     config =
       if temporality, do: Map.put(config, :aggregation_temporality, temporality), else: config
 
-    start_supervised!({MetricStore, config})
+    # These unit tests exercise collection and export transitions directly;
+    # shutdown-specific final-drain coverage lives in the top-level tests.
+    start_supervised!({MetricStore, config}, shutdown: :brutal_kill)
   end
 
   defp request_point(body) do

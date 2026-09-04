@@ -138,6 +138,9 @@ defmodule OtelMetricExporter do
             :otlp -> [{MetricStore, {:prepared, prepared_config}}, {TelemetryHandlers, config}]
           end
 
+        # The configured child order terminates TelemetryHandlers before
+        # MetricStore performs its final drain. Finch is owned by the
+        # application supervisor, outside this per-exporter tree.
         Supervisor.init(children, strategy: :rest_for_one)
 
       {:error, reason} ->

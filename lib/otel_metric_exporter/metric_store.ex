@@ -24,6 +24,7 @@ defmodule OtelMetricExporter.MetricStore do
 
   @default_buckets [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
   @max_pending_intervals 10
+  @otp_cleanup_grace 1_000
 
   defmodule State do
     @moduledoc false
@@ -92,6 +93,27 @@ defmodule OtelMetricExporter.MetricStore do
 
   def start_link(config) do
     GenServer.start_link(__MODULE__, config, name: config.name)
+  end
+
+  @doc false
+  @spec shutdown_timeout(%OtelApi{}) :: pos_integer()
+  def shutdown_timeout(%OtelApi{config: %{otlp_timeout: timeout}}),
+    do: 2 * timeout + @otp_cleanup_grace
+
+  @doc false
+  @spec child_spec(start_arg()) :: Supervisor.child_spec()
+  def child_spec({:prepared, %{api: api}} = prepared_arg) do
+    super(prepared_arg)
+    |> Map.put(:shutdown, shutdown_timeout(api))
+  end
+
+  def child_spec(config) do
+    child_spec = super(config)
+
+    case prepare_config(config) do
+      {:ok, %{api: api}} -> Map.put(child_spec, :shutdown, shutdown_timeout(api))
+      {:error, _reason} -> child_spec
+    end
   end
 
   @doc false
@@ -233,6 +255,8 @@ defmodule OtelMetricExporter.MetricStore do
   end
 
   defp init_enabled(config, api) do
+    Process.flag(:trap_exit, true)
+
     metrics = Map.get(config, :metrics, [])
 
     # Precompute {type, name_string} -> metric lookup map to keep export lookup
@@ -278,7 +302,30 @@ defmodule OtelMetricExporter.MetricStore do
     {:noreply, state}
   end
 
+  @impl true
+  def terminate(reason, state) do
+    # Abnormal exits do not have a reliable transport lifetime, so only the
+    # graceful shutdown reasons run a final drain.
+    # The parent supervisor terminates this child after TelemetryHandlers, so
+    # no new callbacks are attached while this final drain runs. A callback
+    # already executing at detach may still linearize after its series take.
+    if shutdown_reason?(reason) and table_exists?(state.metrics_table) do
+      deadline = OtelApi.new_deadline(state.api)
+      _ = export_metrics(state, deadline, true)
+    end
+
+    :ok
+  end
+
+  defp shutdown_reason?(:shutdown), do: true
+  defp shutdown_reason?({:shutdown, _reason}), do: true
+  defp shutdown_reason?(_reason), do: false
+
   defp export_metrics(%State{} = state) do
+    export_metrics(state, nil, false)
+  end
+
+  defp export_metrics(%State{} = state, deadline, final?) do
     {interval, state} = collect(state)
 
     {pending, retained_drops, merged} =
@@ -298,8 +345,11 @@ defmodule OtelMetricExporter.MetricStore do
       {:ok, %{state | pending_intervals: pending}}
     else
       telemetry_start = ExportTelemetry.start()
-      result = send_payload(state, payload)
-      dropped_items = retained_drops + if terminal?(result), do: batch_size, else: 0
+      result = send_payload(state, payload, deadline)
+
+      dropped_items =
+        retained_drops +
+          if terminal?(result) or (final? and retryable?(result)), do: batch_size, else: 0
 
       ExportTelemetry.stop(telemetry_start, :metrics, batch_size, result, dropped_items)
 
@@ -324,8 +374,14 @@ defmodule OtelMetricExporter.MetricStore do
     end
   end
 
-  defp send_payload(state, payload) do
-    deadline = OtelApi.new_deadline(state.api)
+  defp retryable?({:error, :retryable, _reason}), do: true
+  defp retryable?(_result), do: false
+
+  defp send_payload(state, payload, nil) do
+    send_payload(state, payload, OtelApi.new_deadline(state.api))
+  end
+
+  defp send_payload(state, payload, deadline) do
     {worker_pid, monitor_ref, result_ref} = spawn_export_worker(state.api, payload, deadline)
     await_export_task(result_ref, worker_pid, monitor_ref, deadline)
   end
