@@ -68,6 +68,16 @@ defmodule OtelMetricExporter.MetricStoreTest do
     metric
   end
 
+  defp request_metrics(body) do
+    request = ExportMetricsServiceRequest.decode(body)
+
+    Enum.flat_map(request.resource_metrics, fn %{scope_metrics: scope_metrics} ->
+      Enum.flat_map(scope_metrics, & &1.metrics)
+    end)
+  end
+
+  defp metric_named(metrics, name), do: Enum.find(metrics, &(&1.name == name))
+
   defp response(conn, status) do
     Plug.Conn.resp(conn, status, if(status == 200, do: "", else: "Service Unavailable"))
   end
@@ -628,6 +638,308 @@ defmodule OtelMetricExporter.MetricStoreTest do
       assert {:ok, :ok} = Task.yield(recovery, 5_000)
       assert :sys.get_state(@name).pending_intervals == []
     end
+  end
+
+  @tag :metric_store_concurrency
+  test "assigns writes to the drained or next delta interval at the per-series take boundary",
+       %{bypass: bypass, store_config: config} do
+    metric = Metrics.sum("test.transition")
+    parent = self()
+    start_store(config, [metric], :delta)
+
+    Bypass.expect(bypass, "POST", "/v1/metrics", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(parent, {:transition_request, self(), body})
+
+      receive do
+        :retry -> response(conn, 503)
+        :success -> Plug.Conn.resp(conn, 200, "")
+      end
+    end)
+
+    # This write completes before export_sync can begin its per-series take.
+    MetricStore.write_metric(@name, metric, 10, %{})
+
+    first_export = Task.async(fn -> MetricStore.export_sync(@name) end)
+    assert_receive {:transition_request, first_request_pid, first_body}, 5_000
+    on_exit(fn -> send(first_request_pid, :success) end)
+
+    assert [first_metric] = request_metrics(first_body)
+    assert first_metric.name == "test.transition"
+    assert {:sum, %{data_points: [%{value: {:as_int, 10}}]}} = first_metric.data
+
+    # The request-start message is sent after collect/ets:take has finished.
+    # This write therefore completes after the first drain while that request
+    # is still held, and must be retained for the next interval.
+    MetricStore.write_metric(@name, metric, 20, %{})
+    send(first_request_pid, :retry)
+
+    assert {:ok, {:error, :retryable, {:http_status, 503}}} =
+             Task.yield(first_export, 5_000)
+
+    second_export = Task.async(fn -> MetricStore.export_sync(@name) end)
+    assert_receive {:transition_request, second_request_pid, second_body}, 5_000
+    on_exit(fn -> send(second_request_pid, :success) end)
+
+    assert [second_metric] = request_metrics(second_body)
+    assert second_metric.name == "test.transition"
+    assert {:sum, %{data_points: [%{value: {:as_int, 30}}]}} = second_metric.data
+
+    # One point with 10 + 20 proves the oldest retained interval and the
+    # newest drained interval were merged exactly once for this series.
+    send(second_request_pid, :success)
+    assert {:ok, :ok} = Task.yield(second_export, 5_000)
+    assert :sys.get_state(@name).pending_intervals == []
+    assert MetricStore.get_metrics(@name) == %{}
+  end
+
+  @tag :metric_store_concurrency
+  test "accounts concurrent counter, sum, and distribution writes across bounded delta exports",
+       %{bypass: bypass, store_config: config} do
+    [counter, sum, histogram] = [
+      Metrics.counter("test.stress.counter"),
+      Metrics.sum("test.stress.sum"),
+      Metrics.distribution("test.stress.histogram", reporter_options: [buckets: [0, 1]])
+    ]
+
+    parent = self()
+    tags = %{series: "hot"}
+    writer_count = 6
+    observations_per_writer = 25
+    writer_observation_count = writer_count * observations_per_writer
+    seed_values = [0]
+
+    writer_values = fn writer ->
+      Enum.map(0..(observations_per_writer - 1), &rem(writer + &1, 3))
+    end
+
+    expected_values =
+      seed_values ++
+        Enum.flat_map(0..(writer_count - 1), writer_values)
+
+    expected_count = length(expected_values)
+    expected_sum = Enum.sum(expected_values)
+    writer_observations = Enum.drop(expected_values, 1)
+    writer_sum = Enum.sum(writer_observations)
+
+    expected_bucket_counts = [
+      Enum.count(expected_values, &(&1 <= 0)),
+      Enum.count(expected_values, &(&1 > 0 and &1 <= 1)),
+      Enum.count(expected_values, &(&1 > 1))
+    ]
+
+    writer_bucket_counts = [
+      Enum.count(writer_observations, &(&1 <= 0)),
+      Enum.count(writer_observations, &(&1 > 0 and &1 <= 1)),
+      Enum.count(writer_observations, &(&1 > 1))
+    ]
+
+    start_store(config, [counter, sum, histogram], :delta)
+
+    Bypass.expect(bypass, "POST", "/v1/metrics", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(parent, {:stress_request, self(), body})
+
+      receive do
+        :success -> Plug.Conn.resp(conn, 200, "")
+        :retry -> response(conn, 503)
+      end
+    end)
+
+    # Seed one complete interval, then hold its request while all writers
+    # update the active table. This gives the stress run a deterministic
+    # before-drain/after-drain boundary without relying on scheduler timing.
+    MetricStore.write_metric(@name, counter, :present, tags)
+    MetricStore.write_metric(@name, sum, 0, tags)
+    MetricStore.write_metric(@name, histogram, 0, tags)
+
+    writer_tasks =
+      for writer <- 0..(writer_count - 1) do
+        Task.async(fn ->
+          send(parent, {:writer_ready, self()})
+
+          receive do
+            :go ->
+              [first_value | remaining_values] = writer_values.(writer)
+              MetricStore.write_metric(@name, counter, :present, tags)
+              MetricStore.write_metric(@name, sum, first_value, tags)
+              MetricStore.write_metric(@name, histogram, first_value, tags)
+              send(parent, {:writer_started, self()})
+
+              receive do
+                :continue ->
+                  Enum.each(remaining_values, fn value ->
+                    MetricStore.write_metric(@name, counter, :present, tags)
+                    MetricStore.write_metric(@name, sum, value, tags)
+                    MetricStore.write_metric(@name, histogram, value, tags)
+                  end)
+
+                  send(parent, {:writer_done, self()})
+                  :ok
+              end
+          end
+        end)
+      end
+
+    for _ <- writer_tasks do
+      assert_receive {:writer_ready, _writer_pid}, 5_000
+    end
+
+    first_export = Task.async(fn -> MetricStore.export_sync(@name) end)
+
+    assert_receive {:stress_request, first_request_pid, first_body}, 5_000
+    on_exit(fn -> send(first_request_pid, :success) end)
+    first_metrics = request_metrics(first_body)
+    assert length(first_metrics) == 3
+    first_counter = metric_named(first_metrics, "test.stress.counter")
+    first_sum = metric_named(first_metrics, "test.stress.sum")
+    first_histogram = metric_named(first_metrics, "test.stress.histogram")
+    assert {:sum, %{data_points: [%{value: {:as_int, 1}}]}} = first_counter.data
+    assert {:sum, %{data_points: [%{value: {:as_int, 0}}]}} = first_sum.data
+
+    assert {:histogram, %{data_points: [first_histogram_point]}} = first_histogram.data
+    assert first_histogram_point.count == Enum.sum(first_histogram_point.bucket_counts)
+    assert first_histogram_point.count == 1
+    assert first_histogram_point.sum == 0.0
+    assert first_histogram_point.min == 0.0
+    assert first_histogram_point.max == 0.0
+    assert first_histogram_point.bucket_counts == [1, 0, 0]
+
+    second_export = Task.async(fn -> MetricStore.export_sync(@name) end)
+
+    Enum.each(writer_tasks, fn writer_task -> send(writer_task.pid, :go) end)
+    assert_receive {:writer_started, _writer_pid}, 5_000
+
+    # At least one writer has completed its first observation, but no writer
+    # has been awaited. Releasing the held first request now lets the queued
+    # second collect race the remaining initial writes.
+    send(first_request_pid, :success)
+
+    assert {:ok, :ok} = Task.yield(first_export, 5_000)
+    assert_receive {:stress_request, retry_request_pid, retry_body}, 5_000
+    on_exit(fn -> send(retry_request_pid, :success) end)
+    retry_metrics = request_metrics(retry_body)
+    assert length(retry_metrics) == 3
+    retry_histogram = metric_named(retry_metrics, "test.stress.histogram")
+    assert {:histogram, %{data_points: [retry_histogram_point]}} = retry_histogram.data
+    assert retry_histogram_point.count == Enum.sum(retry_histogram_point.bucket_counts)
+
+    # The request-start message proves the second per-series take is complete.
+    # Let every writer continue while that request is held, so observations
+    # after the take remain in active ETS regardless of the race split.
+    Enum.each(writer_tasks, fn writer_task -> send(writer_task.pid, :continue) end)
+    send(retry_request_pid, :retry)
+    assert {:ok, {:error, :retryable, {:http_status, 503}}} = Task.yield(second_export, 5_000)
+
+    for _ <- writer_tasks do
+      assert_receive {:writer_done, _writer_pid}, 5_000
+    end
+
+    Enum.each(writer_tasks, fn writer_task ->
+      assert {:ok, :ok} = Task.yield(writer_task, 5_000)
+    end)
+
+    state_after_retry = :sys.get_state(@name)
+    assert length(state_after_retry.pending_intervals) == 1
+
+    active_metrics = MetricStore.get_metrics(@name)
+    retained_aggregates = hd(state_after_retry.pending_intervals).aggregates
+    encoded_tags = :erlang.term_to_binary(tags, [:deterministic])
+    counter_key = {:counter, "test.stress.counter", encoded_tags}
+    sum_key = {:sum, "test.stress.sum", encoded_tags}
+    histogram_key = {:distribution, "test.stress.histogram", encoded_tags}
+
+    retained_counter =
+      Map.get(retained_aggregates, counter_key, 0)
+
+    active_counter =
+      active_metrics
+      |> Map.get({:counter, "test.stress.counter"}, %{})
+      |> Map.get(tags, 0)
+
+    retained_sum = Map.get(retained_aggregates, sum_key, 0)
+
+    active_sum =
+      active_metrics
+      |> Map.get({:sum, "test.stress.sum"}, %{})
+      |> Map.get(tags, 0)
+
+    retained_histogram = Map.get(retained_aggregates, histogram_key)
+
+    active_histogram =
+      active_metrics
+      |> Map.get({:distribution, "test.stress.histogram"}, %{})
+      |> Map.get(tags)
+
+    present_histograms = Enum.filter([retained_histogram, active_histogram], &is_map/1)
+    assert present_histograms != []
+
+    Enum.each(present_histograms, fn aggregate ->
+      assert aggregate.count == Enum.sum(aggregate.buckets)
+    end)
+
+    assert retained_counter + active_counter == writer_observation_count
+    assert retained_sum + active_sum == writer_sum
+    assert Enum.sum(Enum.map(present_histograms, & &1.count)) == writer_observation_count
+    assert Enum.sum(Enum.map(present_histograms, & &1.sum)) == writer_sum * 1.0
+    assert Enum.min(Enum.map(present_histograms, & &1.min)) == 0.0
+    assert Enum.max(Enum.map(present_histograms, & &1.max)) == 2.0
+
+    combined_histogram_buckets =
+      Enum.reduce(present_histograms, [0, 0, 0], fn aggregate, totals ->
+        Enum.zip_with(totals, aggregate.buckets, &Kernel.+/2)
+      end)
+
+    assert combined_histogram_buckets == writer_bucket_counts
+    assert Enum.sum(combined_histogram_buckets) == writer_observation_count
+
+    # Before recovery, every writer observation is either in the one retained
+    # interval or active ETS; the split is intentionally not assumed.
+    assert 1 + retained_counter + active_counter == expected_count
+
+    final_export = Task.async(fn -> MetricStore.export_sync(@name) end)
+
+    assert_receive {:stress_request, final_request_pid, final_body}, 5_000
+    on_exit(fn -> send(final_request_pid, :success) end)
+    final_metrics = request_metrics(final_body)
+    assert length(final_metrics) == 3
+
+    final_counter = metric_named(final_metrics, "test.stress.counter")
+    final_sum = metric_named(final_metrics, "test.stress.sum")
+    final_histogram = metric_named(final_metrics, "test.stress.histogram")
+
+    assert {:sum, %{data_points: [%{value: {:as_int, ^writer_observation_count}}]}} =
+             final_counter.data
+
+    assert {:sum, %{data_points: [%{value: {:as_int, ^writer_sum}}]}} = final_sum.data
+
+    assert {:histogram, %{data_points: [final_histogram_point]}} = final_histogram.data
+    assert final_histogram_point.count == Enum.sum(final_histogram_point.bucket_counts)
+    assert final_histogram_point.count == writer_observation_count
+    assert final_histogram_point.sum == writer_sum * 1.0
+    assert final_histogram_point.min == 0.0
+    assert final_histogram_point.max == 2.0
+    assert final_histogram_point.bucket_counts == writer_bucket_counts
+
+    successful_histogram_points = [first_histogram_point, final_histogram_point]
+
+    assert Enum.sum(Enum.map(successful_histogram_points, & &1.count)) == expected_count
+    assert Enum.sum(Enum.map(successful_histogram_points, & &1.sum)) == expected_sum * 1.0
+    assert Enum.min(Enum.map(successful_histogram_points, & &1.min)) == 0.0
+    assert Enum.max(Enum.map(successful_histogram_points, & &1.max)) == 2.0
+
+    successful_bucket_counts =
+      Enum.reduce(successful_histogram_points, [0, 0, 0], fn point, totals ->
+        Enum.zip_with(totals, point.bucket_counts, &Kernel.+/2)
+      end)
+
+    assert successful_bucket_counts == expected_bucket_counts
+    assert Enum.sum(successful_bucket_counts) == expected_count
+
+    send(final_request_pid, :success)
+    assert {:ok, :ok} = Task.yield(final_export, 5_000)
+    assert :sys.get_state(@name).pending_intervals == []
+    assert MetricStore.get_metrics(@name) == %{}
   end
 
   describe "result transitions and retention" do
