@@ -230,11 +230,11 @@ defmodule OtelMetricExporterTest do
                %{}
              ]) == 1
 
-      assert get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
-               {:distribution, "test.distribution"},
-               %{},
-               1
-             ]) == {1, 3}
+      assert %{count: 1, sum: 3, min: 3, max: 3, buckets: [0, 1 | _]} =
+               get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
+                 {:distribution, "test.distribution"},
+                 %{}
+               ])
     end
 
     test "isolates invalid measurements and emits bounded drop events" do

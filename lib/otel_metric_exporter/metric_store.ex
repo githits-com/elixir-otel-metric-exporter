@@ -18,35 +18,42 @@ defmodule OtelMetricExporter.MetricStore do
 
   alias OtelMetricExporter.OtelApi
   alias OtelMetricExporter.ExportTelemetry
+  alias OtelMetricExporter.MetricStore.Aggregate
 
   import OtelMetricExporter.OtlpUtils, only: [build_kv: 1]
 
   @default_buckets [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]
-
-  # Maximum number of generations to retain on export failure.
-  # Prevents unbounded ETS growth when the backend is unreachable.
-  @max_retained_generations 10
+  @max_pending_intervals 10
 
   defmodule State do
     @moduledoc false
+
     defstruct [
       :config,
       :api,
       :metric_lookup,
       :metrics_table,
-      :last_export,
-      :generations_table,
-      :aggregation_temporality
+      :aggregation_temporality,
+      :started_at,
+      :last_collection,
+      pending_intervals: []
     ]
+
+    @type interval :: %{
+            start: non_neg_integer(),
+            finish: non_neg_integer(),
+            aggregates: %{optional(tuple()) => non_neg_integer() | number() | map()}
+          }
 
     @type t :: %__MODULE__{
             config: map(),
             api: %OtelApi{},
             metric_lookup: %{optional({atom(), String.t()}) => Metrics.t()},
             metrics_table: atom(),
-            generations_table: :ets.tid(),
-            last_export: nil | DateTime.t(),
-            aggregation_temporality: :cumulative | :delta
+            aggregation_temporality: :cumulative | :delta,
+            started_at: non_neg_integer(),
+            last_collection: non_neg_integer(),
+            pending_intervals: [interval()]
           }
   end
 
@@ -87,27 +94,17 @@ defmodule OtelMetricExporter.MetricStore do
     GenServer.start_link(__MODULE__, config, name: config.name)
   end
 
-  def get_metrics(metrics_table, generation \\ nil) do
-    generation = generation || :persistent_term.get(generation_key(metrics_table))
+  @doc false
+  @spec get_metrics(atom()) :: map()
+  def get_metrics(metrics_table) do
+    metrics_table
+    |> :ets.tab2list()
+    |> Enum.reduce(%{}, fn {{type, name, encoded_tags}, value}, acc ->
+      tags = decode_tags(encoded_tags)
 
-    :ets.match_object(metrics_table, {{generation, :_, :_, :_, :_}, :_, :_})
-    |> Enum.reduce(%{}, fn
-      {{_, name, :distribution, tags, bucket}, count, sum}, acc ->
-        Map.update(
-          acc,
-          {:distribution, name},
-          %{tags => %{bucket => {count, sum}}},
-          fn all_tags ->
-            Map.update(all_tags, tags, %{bucket => {count, sum}}, fn all_buckets ->
-              Map.put(all_buckets, bucket, {count, sum})
-            end)
-          end
-        )
-
-      {{_, name, type, tags, _}, value, _}, acc ->
-        Map.update(acc, {type, name}, %{tags => value}, fn all_tags ->
-          Map.put(all_tags, tags, value)
-        end)
+      Map.update(acc, {type, name}, %{tags => value}, fn all_tags ->
+        Map.put(all_tags, tags, value)
+      end)
     end)
   end
 
@@ -124,48 +121,47 @@ defmodule OtelMetricExporter.MetricStore do
   def write_metric(metrics_table, metric, value, tags),
     do: write_metric(metrics_table, metric, Enum.join(metric.name, "."), value, tags)
 
-  def write_metric(metrics_table, %Metrics.Counter{} = metric, string_name, _, tags) do
-    generation = :persistent_term.get(generation_key(metrics_table))
-    ets_key = {generation, string_name, metric_type(metric), tags, nil}
-
-    :ets.update_counter(metrics_table, ets_key, 1, {ets_key, 0, nil})
+  def write_metric(metrics_table, %Metrics.Counter{}, string_name, _value, tags) do
+    key = logical_key(:counter, string_name, tags)
+    :ets.update_counter(metrics_table, key, 1, {key, 0})
   end
 
-  def write_metric(metrics_table, %Metrics.Sum{} = metric, string_name, value, tags) do
-    generation = :persistent_term.get(generation_key(metrics_table))
-    ets_key = {generation, string_name, metric_type(metric), tags, nil}
-
-    :ets.update_counter(metrics_table, ets_key, value, {ets_key, 0, nil})
-  end
-
-  def write_metric(metrics_table, %Metrics.LastValue{} = metric, string_name, value, tags) do
-    generation = :persistent_term.get(generation_key(metrics_table))
-    ets_key = {generation, string_name, metric_type(metric), tags, nil}
-    :ets.update_element(metrics_table, ets_key, {2, value}, {ets_key, value, nil})
-  end
-
-  def write_metric(metrics_table, %Metrics.Distribution{} = metric, string_name, value, tags)
+  def write_metric(metrics_table, %Metrics.Sum{}, string_name, value, tags)
       when is_number(value) do
-    bucket = find_bucket(metric, value)
-    generation = :persistent_term.get(generation_key(metrics_table))
-    ets_key = {generation, string_name, metric_type(metric), tags, bucket}
-    update_counter_op = {2, 1}
-    update_sum_op = {3, round(value)}
-
-    :ets.update_counter(
-      metrics_table,
-      ets_key,
-      [update_counter_op, update_sum_op],
-      {ets_key, 0, 0}
-    )
-
-    update_min_max(metrics_table, {generation, string_name, metric_type(metric), tags}, value)
+    key = logical_key(:sum, string_name, tags)
+    cas_update(metrics_table, key, value, &Aggregate.add(:sum, &1, value))
   end
 
-  def write_metric(_metrics_table, %Metrics.Distribution{}, _string_name, _value, _tags) do
+  def write_metric(_metrics_table, %Metrics.Sum{}, _string_name, _value, _tags), do: :ok
+
+  def write_metric(metrics_table, %Metrics.LastValue{}, string_name, value, tags)
+      when is_number(value) do
+    key = logical_key(:last_value, string_name, tags)
+    :ets.insert(metrics_table, {key, value})
     :ok
   end
 
+  def write_metric(_metrics_table, %Metrics.LastValue{}, _string_name, _value, _tags), do: :ok
+
+  def write_metric(metrics_table, %Metrics.Distribution{} = metric, string_name, value, tags)
+      when is_number(value) do
+    bucket_bounds = Keyword.get(metric.reporter_options, :buckets, @default_buckets)
+    bucket = find_bucket(bucket_bounds, value)
+    key = logical_key(:distribution, string_name, tags)
+    initial = Aggregate.new(:distribution, value, bucket, length(bucket_bounds) + 1)
+
+    cas_update(
+      metrics_table,
+      key,
+      initial,
+      &Aggregate.add(:distribution, &1, value, bucket)
+    )
+  end
+
+  def write_metric(_metrics_table, %Metrics.Distribution{}, _string_name, _value, _tags),
+    do: :ok
+
+  @doc false
   def table_exists?(metrics_table) do
     case :ets.whereis(metrics_table) do
       :undefined -> false
@@ -173,9 +169,33 @@ defmodule OtelMetricExporter.MetricStore do
     end
   end
 
-  defp find_bucket(%Metrics.Distribution{reporter_options: opts}, value) do
-    bucket_bounds = Keyword.get(opts, :buckets, @default_buckets)
+  defp cas_update(metrics_table, key, initial, update_fun) do
+    # `select_replace` compares the exact object read above. A failed insert or
+    # replacement means collection or another writer won the race, so retry
+    # against the current table state without a bounded-loss fallback.
+    case :ets.lookup(metrics_table, key) do
+      [] ->
+        if :ets.insert_new(metrics_table, {key, initial}) do
+          :ok
+        else
+          cas_update(metrics_table, key, initial, update_fun)
+        end
 
+      [{^key, current}] ->
+        updated = update_fun.(current)
+        old_object = {key, current}
+        new_object = {key, updated}
+
+        match_spec = [{old_object, [], [{:const, new_object}]}]
+
+        case :ets.select_replace(metrics_table, match_spec) do
+          1 -> :ok
+          0 -> cas_update(metrics_table, key, initial, update_fun)
+        end
+    end
+  end
+
+  defp find_bucket(bucket_bounds, value) do
     case Enum.find_index(bucket_bounds, &(value <= &1)) do
       # Overflow bucket
       nil -> length(bucket_bounds)
@@ -183,30 +203,15 @@ defmodule OtelMetricExporter.MetricStore do
     end
   end
 
-  defp update_min_max(metrics_table, base_key, value) do
-    min_key = Tuple.insert_at(base_key, tuple_size(base_key), :min)
+  defp logical_key(type, name, tags), do: {type, name, canonical_tags(tags)}
 
-    unless :ets.insert_new(metrics_table, {min_key, value, nil}) do
-      case :ets.lookup(metrics_table, min_key) do
-        [{_, current, _}] when value < current ->
-          :ets.insert(metrics_table, {min_key, value, nil})
+  # Keep the internal key component free of maps so it can be embedded as a
+  # literal in the bound CAS match head; deterministic encoding preserves the
+  # exact tag map while remaining separate from external identifiers.
+  defp canonical_tags(tags), do: :erlang.term_to_binary(tags, [:deterministic])
 
-        _ ->
-          :ok
-      end
-    end
-
-    max_key = Tuple.insert_at(base_key, tuple_size(base_key), :max)
-
-    unless :ets.insert_new(metrics_table, {max_key, value, nil}) do
-      case :ets.lookup(metrics_table, max_key) do
-        [{_, current, _}] when value > current ->
-          :ets.insert(metrics_table, {max_key, value, nil})
-
-        _ ->
-          :ok
-      end
-    end
+  defp decode_tags(encoded_tags) do
+    :erlang.binary_to_term(encoded_tags)
   end
 
   @impl true
@@ -229,8 +234,9 @@ defmodule OtelMetricExporter.MetricStore do
 
   defp init_enabled(config, api) do
     metrics = Map.get(config, :metrics, [])
-    # Precompute {type, name_string} -> metric lookup map to replace the O(n²)
-    # scan during export.
+
+    # Precompute {type, name_string} -> metric lookup map to keep export lookup
+    # independent from the number of configured metric definitions.
     metric_lookup =
       Enum.reduce(metrics, %{}, fn metric, lookup ->
         key = {metric_type(metric), OtelMetricExporter.metric_name_string(metric)}
@@ -238,15 +244,10 @@ defmodule OtelMetricExporter.MetricStore do
       end)
 
     metrics_table = config.name
+    now = System.system_time(:nanosecond)
     Process.send_after(self(), :export, config.export_period)
 
-    # Create ETS table for metrics
-    :ets.new(metrics_table, [:ordered_set, :public, :named_table, {:write_concurrency, true}])
-
-    generations_table = :ets.new(:generations, [:ordered_set, :private])
-    :ets.insert(generations_table, {0, System.system_time(:nanosecond), 0})
-    :persistent_term.put(generation_key(metrics_table), 0)
-    aggregation_temporality = Map.get(config, :aggregation_temporality, :cumulative)
+    :ets.new(metrics_table, [:set, :public, :named_table, {:write_concurrency, true}])
 
     {:ok,
      %State{
@@ -254,141 +255,176 @@ defmodule OtelMetricExporter.MetricStore do
        api: api,
        metric_lookup: metric_lookup,
        metrics_table: metrics_table,
-       generations_table: generations_table,
-       aggregation_temporality: aggregation_temporality
+       aggregation_temporality: Map.get(config, :aggregation_temporality, :cumulative),
+       started_at: now,
+       last_collection: now
      }}
   end
 
   @impl true
   def handle_call(:export_sync, _from, state) do
-    {:reply, export_metrics(state), state}
+    {result, state} = export_metrics(state)
+    {:reply, result, state}
   end
 
   @impl true
   def handle_info(:export, state) do
-    {duration, _} = :timer.tc(fn -> export_metrics(state) end, :millisecond)
+    {duration, {result, state}} = :timer.tc(fn -> export_metrics(state) end, :millisecond)
 
-    # schedule after we've sent to avoid problems when there's some kind of
-    # problem sending and we get into a retry loop but take into account
-    # time taken to send so we keep flushing the data on a regular interval
+    _ = result
+    # Schedule after sending so a slow or retrying request does not overlap the
+    # next timer tick, while preserving the configured regular export period.
     Process.send_after(self(), :export, max(state.config.export_period - duration, 100))
-
     {:noreply, state}
   end
 
-  defp rotate_generation(%State{} = state) do
-    current_gen = :persistent_term.get(generation_key(state.metrics_table))
-    :persistent_term.put(generation_key(state.metrics_table), current_gen + 1)
-
-    :ets.update_element(
-      state.generations_table,
-      current_gen,
-      {3, System.system_time(:nanosecond)}
-    )
-
-    :ets.insert(state.generations_table, {current_gen + 1, System.system_time(:nanosecond), nil})
-
-    current_gen
-  end
-
   defp export_metrics(%State{} = state) do
-    current_gen = rotate_generation(state)
+    {interval, state} = collect(state)
 
-    earliest_gen =
-      case :ets.first(state.generations_table) do
-        :"$end_of_table" -> 0
-        x -> x
+    {pending, retained_drops, merged} =
+      case state.aggregation_temporality do
+        :delta ->
+          {pending, retained_drops} = append_pending(state.pending_intervals, interval)
+          {pending, retained_drops, merge_pending(pending)}
+
+        :cumulative ->
+          {[], 0, merge_pending([interval])}
       end
 
-    {earliest_gen, dropped} = maybe_drop_old_generations(state, earliest_gen, current_gen)
+    payload = build_payload(state, merged)
+    batch_size = count_data_points(payload)
 
-    if dropped > 0 do
-      Logger.warning(
-        "OtelMetricExporter dropped old metric generations to prevent unbounded growth",
-        details: %{dropped_generations: dropped}
-      )
-    end
-
-    earliest_gen..current_gen//1
-    |> Enum.reduce(%{}, fn gen, acc ->
-      {_, start, finish} = List.first(:ets.lookup(state.generations_table, gen), {nil, nil, nil})
-
-      get_metrics(state.metrics_table, gen)
-      |> Map.new(fn {metric_key, values} ->
-        {metric_key, Enum.map(values, fn {tags, value} -> {{start, finish}, tags, value} end)}
-      end)
-      |> Map.merge(acc, fn _k, v1, v2 -> v2 ++ v1 end)
-    end)
-    |> Enum.map(fn {key, tagged_values} ->
-      metric = Map.fetch!(state.metric_lookup, key)
-      convert_metric(metric, tagged_values, state.aggregation_temporality)
-    end)
-    |> then(fn payload ->
-      deadline = OtelApi.new_deadline(state.api)
-      batch_size = count_data_points(payload)
+    if batch_size == 0 do
+      {:ok, %{state | pending_intervals: pending}}
+    else
       telemetry_start = ExportTelemetry.start()
-
-      {worker_pid, monitor_ref, result_ref} =
-        spawn_export_worker(state.api, payload, deadline)
-
-      result = await_export_task(result_ref, worker_pid, monitor_ref, deadline)
-      dropped_items = if match?({:error, :terminal, _}, result), do: batch_size, else: 0
+      result = send_payload(state, payload)
+      dropped_items = retained_drops + if terminal?(result), do: batch_size, else: 0
 
       ExportTelemetry.stop(telemetry_start, :metrics, batch_size, result, dropped_items)
-      result
-    end)
-    |> case do
-      :ok ->
-        clear_exported_metrics(state, earliest_gen, current_gen)
-        :ok
 
-      {:partial_success, _rejected_count} = result ->
-        clear_exported_metrics(state, earliest_gen, current_gen)
-        result
+      state =
+        case result do
+          {:error, :retryable, reason} ->
+            log_export_failure(:retryable, reason)
+            %{state | pending_intervals: pending}
 
-      {:error, :terminal, reason} = result ->
-        log_export_failure(:terminal, reason)
-        clear_exported_metrics(state, earliest_gen, current_gen)
-        result
+          :ok ->
+            %{state | pending_intervals: []}
 
-      {:error, :retryable, reason} = result ->
-        log_export_failure(:retryable, reason)
-        result
+          {:partial_success, _} ->
+            %{state | pending_intervals: []}
+
+          {:error, :terminal, reason} ->
+            log_export_failure(:terminal, reason)
+            %{state | pending_intervals: []}
+        end
+
+      {result, state}
     end
   end
 
-  @spec maybe_drop_old_generations(%State{}, non_neg_integer(), non_neg_integer()) ::
-          {non_neg_integer(), non_neg_integer()}
-  defp maybe_drop_old_generations(state, earliest_gen, current_gen) do
-    total = current_gen - earliest_gen + 1
+  defp send_payload(state, payload) do
+    deadline = OtelApi.new_deadline(state.api)
+    {worker_pid, monitor_ref, result_ref} = spawn_export_worker(state.api, payload, deadline)
+    await_export_task(result_ref, worker_pid, monitor_ref, deadline)
+  end
 
-    if total > @max_retained_generations do
-      drop_until = current_gen - @max_retained_generations + 1
+  defp collect(%State{aggregation_temporality: :delta} = state) do
+    finish = System.system_time(:nanosecond)
 
-      for gen <- earliest_gen..(drop_until - 1)//1 do
-        :ets.match_delete(state.metrics_table, {{gen, :_, :_, :_, :_}, :_, :_})
-        :ets.delete(state.generations_table, gen)
-      end
+    keys = :ets.select(state.metrics_table, [{{:"$1", :_}, [], [:"$1"]}])
 
-      {drop_until, drop_until - earliest_gen}
-    else
-      {earliest_gen, 0}
-    end
+    aggregates =
+      Enum.reduce(keys, %{}, fn key, acc ->
+        case :ets.take(state.metrics_table, key) do
+          [{^key, value}] -> Map.put(acc, key, value)
+          [] -> acc
+        end
+      end)
+
+    interval = %{start: state.last_collection, finish: finish, aggregates: aggregates}
+    {interval, %{state | last_collection: finish}}
+  end
+
+  defp collect(%State{aggregation_temporality: :cumulative} = state) do
+    finish = System.system_time(:nanosecond)
+
+    aggregates =
+      state.metrics_table
+      |> :ets.tab2list()
+      |> Map.new()
+
+    interval = %{start: state.started_at, finish: finish, aggregates: aggregates}
+    {interval, %{state | last_collection: finish}}
+  end
+
+  defp append_pending(pending, %{aggregates: aggregates} = _interval)
+       when map_size(aggregates) == 0,
+       do: {pending, 0}
+
+  defp append_pending(pending, interval) do
+    intervals = pending ++ [interval]
+    overflow = max(length(intervals) - @max_pending_intervals, 0)
+    evicted = Enum.take(intervals, overflow)
+    retained = Enum.drop(intervals, overflow)
+
+    {retained, Enum.reduce(evicted, 0, &(map_size(&1.aggregates) + &2))}
+  end
+
+  defp merge_pending(intervals) do
+    Enum.reduce(intervals, %{}, fn interval, merged ->
+      Enum.reduce(interval.aggregates, merged, fn {key, row}, acc ->
+        type = elem(key, 0)
+
+        case Map.fetch(acc, key) do
+          :error ->
+            tags = decode_tags(elem(key, 2))
+            Map.put(acc, key, {interval.start, interval.finish, tags, row})
+
+          {:ok, {start, _finish, tags, current}} ->
+            Map.put(acc, key, {
+              start,
+              interval.finish,
+              tags,
+              Aggregate.merge(type, current, row)
+            })
+        end
+      end)
+    end)
+  end
+
+  defp build_payload(state, merged) do
+    merged
+    |> Enum.group_by(fn {{type, name, _tags}, _value} -> {type, name} end)
+    |> Enum.map(fn {key, values} ->
+      metric = Map.fetch!(state.metric_lookup, key)
+
+      tagged_values =
+        Enum.map(values, fn {{_type, _name, _tags}, {from, to, tags, value}} ->
+          {{from, to}, tags, value}
+        end)
+
+      convert_metric(metric, tagged_values, state.aggregation_temporality)
+    end)
   end
 
   @spec count_data_points(list(Metric.t())) :: non_neg_integer()
   defp count_data_points(metrics) do
     Enum.reduce(metrics, 0, fn
-      %Metric{data: {:sum, %Sum{data_points: data_points}}}, count ->
-        count + length(data_points)
+      %Metric{data: {:sum, %Sum{data_points: points}}}, count ->
+        count + length(points)
 
-      %Metric{data: {:gauge, %Gauge{data_points: data_points}}}, count ->
-        count + length(data_points)
+      %Metric{data: {:gauge, %Gauge{data_points: points}}}, count ->
+        count + length(points)
 
-      %Metric{data: {:histogram, %Histogram{data_points: data_points}}}, count ->
-        count + length(data_points)
+      %Metric{data: {:histogram, %Histogram{data_points: points}}}, count ->
+        count + length(points)
     end)
   end
+
+  defp terminal?({:error, :terminal, _}), do: true
+  defp terminal?(_), do: false
 
   @spec spawn_export_worker(%OtelApi{}, list(), OtelApi.deadline()) ::
           {pid(), reference(), reference()}
@@ -497,16 +533,6 @@ defmodule OtelMetricExporter.MetricStore do
   defp format_failure_reason({:http_status, status}),
     do: "http_status=#{Integer.to_string(status)}"
 
-  @spec clear_exported_metrics(%State{}, non_neg_integer(), non_neg_integer()) :: :ok
-  defp clear_exported_metrics(state, earliest_gen, current_gen) do
-    for x <- earliest_gen..current_gen//1 do
-      :ets.match_delete(state.metrics_table, {{x, :_, :_, :_, :_}, :_, :_})
-      :ets.delete(state.generations_table, x)
-    end
-
-    :ok
-  end
-
   defp convert_metric(
          %{description: description, unit: unit} = metric,
          values,
@@ -561,8 +587,8 @@ defmodule OtelMetricExporter.MetricStore do
          Enum.map(values, fn {{_from, to}, tags, value} ->
            %NumberDataPoint{
              attributes: build_kv(tags),
-             # Gauge data points must not set start_time_unix_nano. The Datadog
-             # Agent interprets a non-zero start time as a rate denominator.
+             # Gauges must not set start_time_unix_nano; Datadog interprets a
+             # non-zero start time as a rate denominator.
              start_time_unix_nano: 0,
              time_unix_nano: to,
              value: convert_value(value, :double)
@@ -573,35 +599,21 @@ defmodule OtelMetricExporter.MetricStore do
 
   defp convert_data(%Metrics.Distribution{reporter_options: opts}, values, temporality) do
     bucket_bounds = Keyword.get(opts, :buckets, @default_buckets)
-    total_bucket_bounds = length(bucket_bounds)
 
     {:histogram,
      %Histogram{
        data_points:
-         Enum.map(values, fn {{from, to}, tags, bucket_values} ->
-           {min_value, _} = Map.get(bucket_values, :min, {nil, nil})
-           {max_value, _} = Map.get(bucket_values, :max, {nil, nil})
-           bucket_values = Map.drop(bucket_values, [:min, :max])
-
-           {total_count, total_sum} =
-             Enum.reduce(bucket_values, {0, 0.0}, fn {_, {count, sum}},
-                                                     {total_count, total_sum} ->
-               {total_count + count, total_sum + sum}
-             end)
-
-           bucket_counts =
-             Enum.map(0..total_bucket_bounds//1, &elem(Map.get(bucket_values, &1, {0, 0}), 0))
-
+         Enum.map(values, fn {{from, to}, tags, aggregate} ->
            %HistogramDataPoint{
              attributes: build_kv(tags),
              start_time_unix_nano: from,
              time_unix_nano: to,
-             count: total_count,
-             sum: total_sum,
-             bucket_counts: bucket_counts,
+             count: aggregate.count,
+             sum: aggregate.sum / 1,
+             bucket_counts: aggregate.buckets,
              explicit_bounds: bucket_bounds,
-             min: min_value && min_value / 1,
-             max: max_value && max_value / 1
+             min: aggregate.min / 1,
+             max: aggregate.max / 1
            }
          end),
        aggregation_temporality: otlp_temporality(temporality)
@@ -625,29 +637,18 @@ defmodule OtelMetricExporter.MetricStore do
   defp convert_unit(:terabyte), do: "TBy"
   defp convert_unit(x) when is_atom(x), do: Atom.to_string(x)
 
-  # These clauses are here to preserve the current behaviour of the library and avoid
-  # introducing unexpected errors. Ideally, we would filter these nil/:undefined values higher
-  # up in the call stack and stop short of exporting metrics with nil values.
-  #
-  # `:telemetry` emits `:undefined` for uninitialised values, so we treat it the same as `nil`.
-  defp convert_value(nil, :int), do: {:as_int, nil}
-  defp convert_value(nil, :double), do: {:as_double, nil}
-  defp convert_value(:undefined, :int), do: {:as_int, nil}
-  defp convert_value(:undefined, :double), do: {:as_double, nil}
-
   @signed_int64_max 2 ** 63 - 1
   @signed_int64_min -2 ** 63
+
+  # Preserve integer encoding when the value fits OTLP's signed int64 range;
+  # larger integers and floating-point values use the double representation.
   defp convert_value(int, _preferred_type)
        when is_integer(int) and int >= @signed_int64_min and int <= @signed_int64_max,
        do: {:as_int, int}
 
-  # The OpenTelemetry protocol has no supporrt for bigint, so the best we can do is convert to
-  # double at the cost of losing some precision.
+  # OTLP has no bigint representation, so larger integers are converted to
+  # double at the cost of precision.
   defp convert_value(bigint_or_float, _preferred_type)
        when is_integer(bigint_or_float) or is_float(bigint_or_float),
        do: {:as_double, bigint_or_float / 1}
-
-  defp generation_key(metrics_table) do
-    {__MODULE__, metrics_table, :generation}
-  end
 end

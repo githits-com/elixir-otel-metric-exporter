@@ -1,8 +1,7 @@
 defmodule OtelMetricExporter.TelemetryHandlers do
-  # Simple genserver that handles attaching the handler to the configured metrics
-  # Ensures that metrics are attached **after** the MetricStore has started
-  # and setup the generation_key system to avoid race conditions where
-  # metrics are put before the MetricStore has started
+  # Simple genserver that handles attaching the handler to the configured metrics.
+  # Attach handlers **after** the MetricStore has started so the stable metrics
+  # table exists before telemetry callbacks can write measurements.
   #
   # We could do the attach call in init and return :ignore
   # but this way we keep the handler ids around.

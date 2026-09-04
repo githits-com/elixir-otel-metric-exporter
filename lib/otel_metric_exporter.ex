@@ -82,8 +82,8 @@ defmodule OtelMetricExporter do
   @type option() :: unquote(NimbleOptions.option_typespec(@options_schema))
 
   @doc """
-  Start the exporter. It maintains some pieces of global state: ets table and a `:persistent_term` key.
-  This means that only one exporter instance can be started at a time.
+  Start the exporter. It maintains a named ETS table for collected metrics, so
+  each exporter instance must use a unique `name`.
 
   ## Options
 
