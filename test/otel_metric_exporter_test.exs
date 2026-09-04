@@ -214,7 +214,7 @@ defmodule OtelMetricExporterTest do
 
       metrics = [
         Metrics.distribution("test.distribution", event_name: event, measurement: :value),
-        Metrics.counter("test.counter", event_name: event)
+        Metrics.counter("test.counter", event_name: event, measurement: :value)
       ]
 
       exporter = start_supervised!({OtelMetricExporter, @base_config ++ [metrics: metrics]})
@@ -228,13 +228,211 @@ defmodule OtelMetricExporterTest do
       assert get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
                {:counter, "test.counter"},
                %{}
-             ]) == 2
+             ]) == 1
 
       assert get_in(OtelMetricExporter.MetricStore.get_metrics(@name), [
                {:distribution, "test.distribution"},
                %{},
                1
              ]) == {1, 3}
+    end
+
+    test "isolates invalid measurements and emits bounded drop events" do
+      event = [:test, :invalid_measurements]
+      drop_event = [:otel_metric_exporter, :metric, :measurement_dropped]
+      receiver = self()
+      handler_id = {:measurement_dropped_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        drop_event,
+        fn ^drop_event, measurements, metadata, _config ->
+          send(receiver, {:measurement_dropped, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      metrics = [
+        Metrics.counter("test.counter_missing_absent", event_name: event, measurement: :absent),
+        Metrics.counter("test.counter_missing_undefined",
+          event_name: event,
+          measurement: :counter_undefined
+        ),
+        Metrics.counter("test.counter_present", event_name: event, measurement: :counter_value),
+        Metrics.sum("test.sum_missing", event_name: event, measurement: :sum_missing),
+        Metrics.sum("test.sum_non_numeric", event_name: event, measurement: :sum_non_numeric),
+        Metrics.last_value("test.last_value_missing",
+          event_name: event,
+          measurement: :last_value_missing
+        ),
+        Metrics.last_value("test.last_value_non_numeric",
+          event_name: event,
+          measurement: :last_value_non_numeric
+        ),
+        Metrics.distribution("test.distribution_missing",
+          event_name: event,
+          measurement: :distribution_missing
+        ),
+        Metrics.distribution("test.distribution_non_numeric",
+          event_name: event,
+          measurement: :distribution_non_numeric
+        ),
+        Metrics.sum("test.sibling", event_name: event, measurement: :sibling)
+      ]
+
+      exporter = start_supervised!({OtelMetricExporter, @base_config ++ [metrics: metrics]})
+
+      :telemetry.execute(
+        event,
+        %{
+          counter_value: "present but not numeric",
+          counter_undefined: :undefined,
+          sum_missing: nil,
+          sum_non_numeric: "not numeric",
+          last_value_missing: nil,
+          last_value_non_numeric: %{},
+          distribution_missing: :undefined,
+          distribution_non_numeric: "not numeric",
+          sibling: 7
+        },
+        %{}
+      )
+
+      drops =
+        for _ <- 1..8 do
+          assert_receive {:measurement_dropped, measurements, metadata}
+          assert measurements == %{count: 1}
+          assert metadata == %{metric_type: metadata.metric_type, reason: metadata.reason}
+          metadata
+        end
+
+      assert Enum.frequencies(drops) == %{
+               %{metric_type: :counter, reason: :missing} => 2,
+               %{metric_type: :sum, reason: :missing} => 1,
+               %{metric_type: :sum, reason: :non_numeric} => 1,
+               %{metric_type: :last_value, reason: :missing} => 1,
+               %{metric_type: :last_value, reason: :non_numeric} => 1,
+               %{metric_type: :distribution, reason: :missing} => 1,
+               %{metric_type: :distribution, reason: :non_numeric} => 1
+             }
+
+      refute_receive {:measurement_dropped, _measurements, _metadata}
+      assert Process.alive?(exporter)
+      assert :telemetry.list_handlers(event) != []
+
+      stored = OtelMetricExporter.MetricStore.get_metrics(@name)
+      assert get_in(stored, [{:counter, "test.counter_present"}, %{}]) == 1
+      assert get_in(stored, [{:sum, "test.sibling"}, %{}]) == 7
+    end
+
+    test "preserves callback failures without classifying them as dropped measurements" do
+      drop_event = [:otel_metric_exporter, :metric, :measurement_dropped]
+      receiver = self()
+      handler_id = {:measurement_dropped_callback_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        drop_event,
+        fn ^drop_event, measurements, metadata, _config ->
+          send(receiver, {:measurement_dropped, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      start_supervised!({OtelMetricExporter, @base_config ++ [metrics: []]})
+
+      keep_failure =
+        Metrics.sum("test.keep_failure",
+          keep: fn _metadata -> raise "keep callback failed" end
+        )
+
+      assert_raise RuntimeError, "keep callback failed", fn ->
+        OtelMetricExporter.handle_metric(
+          [:test],
+          %{value: 1},
+          %{},
+          %{metrics: [{keep_failure, "test.keep_failure"}], name: @name, handler_id: :unused}
+        )
+      end
+
+      measurement_failure =
+        Metrics.sum("test.measurement_failure",
+          measurement: fn _measurements -> raise "measurement callback failed" end
+        )
+
+      assert_raise RuntimeError, "measurement callback failed", fn ->
+        OtelMetricExporter.handle_metric(
+          [:test],
+          %{value: 1},
+          %{},
+          %{
+            metrics: [{measurement_failure, "test.measurement_failure"}],
+            name: @name,
+            handler_id: :unused
+          }
+        )
+      end
+
+      measurement_throw =
+        Metrics.sum("test.measurement_throw",
+          measurement: fn _measurements -> throw(:measurement_callback_thrown) end
+        )
+
+      assert catch_throw(
+               OtelMetricExporter.handle_metric(
+                 [:test],
+                 %{value: 1},
+                 %{},
+                 %{
+                   metrics: [{measurement_throw, "test.measurement_throw"}],
+                   name: @name,
+                   handler_id: :unused
+                 }
+               )
+             ) == :measurement_callback_thrown
+
+      tag_failure =
+        Metrics.sum("test.tag_failure",
+          measurement: :value,
+          tags: [:tag],
+          tag_values: fn _metadata -> exit(:tag_callback_failed) end
+        )
+
+      assert catch_exit(
+               OtelMetricExporter.handle_metric(
+                 [:test],
+                 %{value: 1},
+                 %{},
+                 %{metrics: [{tag_failure, "test.tag_failure"}], name: @name, handler_id: :unused}
+               )
+             ) == :tag_callback_failed
+
+      invalid_measurement_tag_failure =
+        Metrics.sum("test.invalid_measurement_tag_failure",
+          measurement: :missing,
+          tags: [:tag],
+          tag_values: fn _metadata -> raise "tag callback failed" end
+        )
+
+      assert_raise RuntimeError, "tag callback failed", fn ->
+        OtelMetricExporter.handle_metric(
+          [:test],
+          %{missing: nil},
+          %{},
+          %{
+            metrics: [
+              {invalid_measurement_tag_failure, "test.invalid_measurement_tag_failure"}
+            ],
+            name: @name,
+            handler_id: :unused
+          }
+        )
+      end
+
+      refute_receive {:measurement_dropped, _measurements, _metadata}
     end
 
     test "handles tag functions" do
