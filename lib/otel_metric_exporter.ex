@@ -46,6 +46,8 @@ defmodule OtelMetricExporter do
     Metrics.Distribution
   ]
 
+  @measurement_dropped_event [:otel_metric_exporter, :metric, :measurement_dropped]
+
   @options_schema NimbleOptions.new!(
                     [
                       metrics: [
@@ -80,8 +82,8 @@ defmodule OtelMetricExporter do
   @type option() :: unquote(NimbleOptions.option_typespec(@options_schema))
 
   @doc """
-  Start the exporter. It maintains some pieces of global state: ets table and a `:persistent_term` key.
-  This means that only one exporter instance can be started at a time.
+  Start the exporter. It maintains a named ETS table for collected metrics, so
+  each exporter instance must use a unique `name`.
 
   ## Options
 
@@ -136,6 +138,9 @@ defmodule OtelMetricExporter do
             :otlp -> [{MetricStore, {:prepared, prepared_config}}, {TelemetryHandlers, config}]
           end
 
+        # The configured child order terminates TelemetryHandlers before
+        # MetricStore performs its final drain. Finch is owned by the
+        # application supervisor, outside this per-exporter tree.
         Supervisor.init(children, strategy: :rest_for_one)
 
       {:error, reason} ->
@@ -154,7 +159,13 @@ defmodule OtelMetricExporter do
         value = extract_measurement(metric, measurements, metadata)
         tags = extract_tags(metric, metadata)
 
-        MetricStore.write_metric(name, metric, metric_name, value, tags)
+        case classify_measurement(metric, value) do
+          :ok ->
+            MetricStore.write_metric(name, metric, metric_name, value, tags)
+
+          {:drop, reason} ->
+            emit_measurement_dropped(metric, reason)
+        end
       end
     end
   rescue
@@ -181,6 +192,30 @@ defmodule OtelMetricExporter do
     |> metric.tag_values.()
     |> Map.take(metric.tags)
   end
+
+  defp classify_measurement(%Metrics.Counter{}, value) when value in [nil, :undefined],
+    do: {:drop, :missing}
+
+  defp classify_measurement(%Metrics.Counter{}, _value), do: :ok
+
+  defp classify_measurement(_metric, value) when value in [nil, :undefined],
+    do: {:drop, :missing}
+
+  defp classify_measurement(_metric, value) when is_number(value), do: :ok
+  defp classify_measurement(_metric, _value), do: {:drop, :non_numeric}
+
+  defp emit_measurement_dropped(metric, reason) do
+    :telemetry.execute(
+      @measurement_dropped_event,
+      %{count: 1},
+      %{metric_type: metric_type(metric), reason: reason}
+    )
+  end
+
+  defp metric_type(%Metrics.Counter{}), do: :counter
+  defp metric_type(%Metrics.Sum{}), do: :sum
+  defp metric_type(%Metrics.LastValue{}), do: :last_value
+  defp metric_type(%Metrics.Distribution{}), do: :distribution
 
   @doc false
   @spec metric_name_string(Metrics.t()) :: String.t()
