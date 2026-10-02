@@ -55,9 +55,14 @@ as `reason: :non_numeric`.
 Counters retain presence semantics: every present measurement increments the
 counter by one, regardless of its value or type.
 
-If the Logger callback raises, exits, or throws while preparing or loading a log
-event, the handler emits `[:otel_metric_exporter, :log_handler, :exception]`
-before preserving the original failure. Its sole measurement is `count: 1`.
+An error preparing a Logger event omits only that event and returns `:ok`, so
+later events use the same installed handler. OLP liveness/load failures and
+preparation exits/throws still propagate. This is event containment, not handler
+reinstallation; an escaping callback failure can still make OTP remove the
+handler. HTTP export failure is a separate batch failure.
+
+Callback failures emit `[:otel_metric_exporter, :log_handler, :exception]`.
+Its sole measurement is `count: 1`.
 Metadata contains only fixed classifications: `stage` (`olp_liveness`,
 `prepare`, `load`, or `handler`), `failure_source` (`trace_context`, `body`,
 `attributes`, `protocol`, `olp`, `handler`, or `unknown`), `exception`,
@@ -65,11 +70,23 @@ Metadata contains only fixed classifications: `stage` (`olp_liveness`,
 and the boolean `olp_alive`. The module types enumerate the exception and
 message-shape values. It never includes the log event, Logger metadata,
 exception reason, stacktrace, endpoint, headers, or response content.
+Contained errors report the known `stage: :prepare` even when the retained stack
+is truncated; source classification remains approximate and may be `:unknown`.
+A process-local guard suppresses recursive diagnostics from telemetry consumers.
 
 Logger report maps may use arbitrary Erlang terms as keys and values. Nested
 plain maps retain their flattened dotted-key representation, while structs and
 other scalar terms are encoded through their inspected representation. These
 valid report shapes do not detach the handler.
+
+Nonempty whole keyword lists encode as key/value lists, preserving order and
+duplicate keys. Empty lists and other proper lists encode as arrays; tuples keep
+their existing array representation. Improper list values encode as inspected
+strings at each nested value boundary, including inside report maps. This does
+not expand support for whole improper report bodies.
+
+See [the Logger implementation notes](docs/implementation/LOG_HANDLER.md) for
+failure boundaries and verification evidence.
 
 ## Configuration changes
 

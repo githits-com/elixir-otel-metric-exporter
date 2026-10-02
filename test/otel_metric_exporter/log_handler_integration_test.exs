@@ -4,7 +4,7 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
 
   alias OtelMetricExporter.LogHandler
   alias OtelMetricExporter.Opentelemetry.Proto.Collector.Logs.V1.ExportLogsServiceRequest
-  alias OtelMetricExporter.Opentelemetry.Proto.Common.V1.AnyValue
+  alias OtelMetricExporter.Opentelemetry.Proto.Common.V1.{AnyValue, ArrayValue, KeyValueList}
   alias OtelMetricExporter.Opentelemetry.Proto.Logs.V1.LogRecord
 
   require Logger
@@ -14,6 +14,11 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
     # Use small debounce/buffer to make tests predictable
     debounce_ms: 10,
     max_buffer_size: 1,
+    # A single request at a time makes later marker delivery an export barrier
+    # for preceding loads from the same producer, only in this fixture.
+    otlp_concurrent_requests: 1,
+    otlp_headers: %{},
+    retry: false,
     # Map request_id from metadata
     metadata_map: %{
       request_id: "http.request.id"
@@ -27,25 +32,27 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
 
     config =
       Map.merge(@default_config, %{
-        otlp_endpoint: "http://localhost:#{bypass.port}"
+        otlp_endpoint: "http://127.0.0.1:#{bypass.port}"
       })
-
-    # Ensure :otel_metric_exporter app env is clean or set if needed,
-    # although handler config should override
-    # Application.put_env(:otel_metric_exporter, :otlp_endpoint, config.otlp_endpoint)
-    # Application.put_env(:otel_metric_exporter, :resource, config.resource)
 
     # Add the handler for this test
     :ok = :logger.add_handler(handler_id, LogHandler, %{config: config})
 
     # Ensure the handler is removed after the test finishes
     on_exit(fn ->
-      # Wait briefly for logs potentially in flight due to debounce
-      Process.sleep(50)
-      _ = :logger.remove_handler(handler_id)
-      # Clean up app env if needed
-      # Application.delete_env(:otel_metric_exporter, :otlp_endpoint)
-      # Application.delete_env(:otel_metric_exporter, :resource)
+      # Receiver messages precede completion of the HTTP callback. Let Bypass
+      # finish those callbacks before stopping the handler's HTTP tasks.
+      :ok = Bypass.down(bypass)
+
+      case Process.whereis(:"#{LogHandler}_#{handler_id}") do
+        nil ->
+          _ = :logger.remove_handler(handler_id)
+
+        supervisor ->
+          ref = Process.monitor(supervisor)
+          :ok = :logger.remove_handler(handler_id)
+          assert_receive {:DOWN, ^ref, :process, ^supervisor, _}, 1_000
+      end
     end)
 
     {:ok, bypass: bypass, handler_id: handler_id, config: config}
@@ -109,6 +116,186 @@ defmodule OtelMetricExporter.LogHandlerIntegrationTest do
 
     assert_receive {:logs, [%LogRecord{body: %{value: {:string_value, "after report"}}}]}, 500
   end
+
+  test "mixed and improper report values export before later logs through the same components", %{
+    bypass: bypass,
+    handler_id: handler_id
+  } do
+    observe_batches(bypass)
+    attach_failure_observer()
+    components = handler_components(handler_id)
+    trace = String.duplicate("a", 32)
+    span = String.duplicate("b", 16)
+
+    mixed =
+      {:array_value,
+       %ArrayValue{
+         values: [
+           %AnyValue{
+             value:
+               {:array_value,
+                %ArrayValue{
+                  values: [
+                    %AnyValue{value: {:string_value, "a"}},
+                    %AnyValue{value: {:int_value, 1}}
+                  ]
+                }}
+           },
+           %AnyValue{value: {:string_value, "b"}}
+         ]
+       }}
+
+    improper =
+      {:array_value, %ArrayValue{values: [%AnyValue{value: {:string_value, inspect([1 | 2])}}]}}
+
+    for {label, payload, expected} <- [
+          {"mixed", [{:a, 1}, :b], mixed},
+          {"improper", [[1 | 2]], improper}
+        ],
+        {context, metadata} <- [
+          {"trace-free", []},
+          {"traced", [otel_trace_id: trace, otel_span_id: span]}
+        ] do
+      marker = "#{label}-#{context}-#{System.unique_integer([:positive])}"
+      # Leave the normal Logger translator installed; an unknown report label
+      # can suppress the report before it reaches this handler.
+      Logger.info(%{payload: payload}, [{:event_name, marker} | metadata])
+      {record, _all_received} = receive_records_until(&(&1.event_name == marker))
+
+      assert {:kvlist_value, %KeyValueList{values: [value]}} = record.body.value
+      assert value.key == "payload"
+      assert value.value.value == expected
+
+      if context == "traced" do
+        assert record.trace_id == :binary.copy(<<0xAA>>, 16)
+        assert record.span_id == :binary.copy(<<0xBB>>, 8)
+      else
+        assert record.trace_id == ""
+        assert record.span_id == ""
+      end
+
+      later = "after-#{marker}"
+      Logger.info(later)
+
+      {ordinary, _all_received} =
+        receive_records_until(&(&1.body.value == {:string_value, later}))
+
+      assert ordinary.body.value == {:string_value, later}
+      assert_same_components(handler_id, components)
+      refute_receive {:handler_failure, _, _}, 0
+    end
+  end
+
+  test "one malformed preparation event is omitted from all batches and later Logger delivery continues",
+       %{
+         bypass: bypass,
+         handler_id: handler_id
+       } do
+    observe_batches(bypass)
+    attach_failure_observer()
+    components = handler_components(handler_id)
+    id = System.unique_integer([:positive])
+    bad = "malformed-#{id}"
+    before_marker = "before-malformed-#{id}"
+    after_marker = "after-malformed-#{id}"
+
+    Logger.info(before_marker)
+
+    {_record, before_records} =
+      receive_records_until(&(&1.body.value == {:string_value, before_marker}), bad)
+
+    Logger.info(bad, otel_trace_id: "not-hex")
+
+    assert_receive {:handler_failure, %{count: 1}, metadata}, 1_000
+
+    assert metadata == %{
+             stage: :prepare,
+             failure_source: :trace_context,
+             exception: :argument_error,
+             message_shape: :string,
+             trace_context: :invalid,
+             olp_alive: true
+           }
+
+    Logger.info(after_marker)
+
+    {ordinary, received} =
+      receive_records_until(&(&1.body.value == {:string_value, after_marker}), bad)
+
+    # Check all received records, including unmatched batches and the complete
+    # matched batch. A single-request fixture plus same-producer OLP ordering
+    # means an erroneously loaded bad event cannot arrive behind this marker.
+    assert Enum.all?(before_records ++ received, &(&1.body.value != {:string_value, bad}))
+    assert ordinary.body.value == {:string_value, after_marker}
+    assert_same_components(handler_id, components)
+    refute_receive {:handler_failure, _, _}, 0
+  end
+
+  defp observe_batches(bypass) do
+    parent = self()
+
+    Bypass.expect(bypass, "POST", "/v1/logs", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = decode_request_body(body)
+
+      records =
+        for resource <- request.resource_logs,
+            scope <- resource.scope_logs,
+            record <- scope.log_records,
+            do: record
+
+      send(parent, {:regression_batch, records})
+      Plug.Conn.resp(conn, 200, "")
+    end)
+  end
+
+  defp receive_records_until(predicate, forbidden \\ nil, received \\ []) do
+    assert_receive {:regression_batch, records}, 1_000
+
+    if forbidden do
+      for record <- records do
+        refute record.body.value == {:string_value, forbidden}
+      end
+    end
+
+    received = received ++ records
+
+    case Enum.find(records, predicate) do
+      nil -> receive_records_until(predicate, forbidden, received)
+      record -> {record, received}
+    end
+  end
+
+  defp handler_components(id) do
+    supervisor = Process.whereis(:"#{LogHandler}_#{id}")
+    olp = Process.whereis(:"#{LogHandler}_#{id}_logger_olp")
+    assert is_pid(supervisor) and is_pid(olp)
+    {supervisor, olp}
+  end
+
+  defp assert_same_components(id, {supervisor, olp}) do
+    assert id in :logger.get_handler_ids()
+    assert Process.whereis(:"#{LogHandler}_#{id}") == supervisor
+    assert Process.whereis(:"#{LogHandler}_#{id}_logger_olp") == olp
+    assert Process.alive?(supervisor) and Process.alive?(olp)
+  end
+
+  defp attach_failure_observer do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:otel_metric_exporter, :log_handler, :exception],
+        &__MODULE__.handle_failure/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  def handle_failure(_event, measurements, metadata, parent),
+    do: send(parent, {:handler_failure, measurements, metadata})
 
   test "captures Logger.error message with correct severity", %{bypass: bypass} do
     parent = self()

@@ -40,26 +40,27 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetry do
           required(:olp_alive) => boolean()
         }
 
-  @spec emit(:logger.log_event(), pid(), :error | :exit | :throw, term(), list()) :: :ok
-  def emit(event, olp_pid, kind, reason, stacktrace) do
+  @spec emit(:logger.log_event(), pid(), :error | :exit | :throw, term(), list(), :prepare | nil) ::
+          :ok
+  def emit(event, olp_pid, kind, reason, stacktrace, known_stage \\ nil) do
     if Process.get(@emitting_key) do
       :ok
     else
       Process.put(@emitting_key, true)
 
       try do
-        execute(event, olp_pid, kind, reason, stacktrace)
+        execute(event, olp_pid, kind, reason, stacktrace, known_stage)
       after
         Process.delete(@emitting_key)
       end
     end
   end
 
-  defp execute(event, olp_pid, kind, reason, stacktrace) do
+  defp execute(event, olp_pid, kind, reason, stacktrace, known_stage) do
     olp_alive = Process.alive?(olp_pid)
 
     :telemetry.execute(@event, %{count: 1}, %{
-      stage: stage(stacktrace, olp_alive),
+      stage: known_stage || stage(stacktrace, olp_alive),
       failure_source: failure_source(stacktrace),
       exception: exception(kind, reason),
       message_shape: message_shape(event),
