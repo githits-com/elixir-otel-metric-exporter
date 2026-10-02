@@ -133,4 +133,7 @@ preparation helpers; no broader refactor is justified.
   inherited accumulator completion and handler lifecycle/configuration behavior.
 - mix format --check-formatted passed. Accumulator source/tests and mix.lock are
   exactly the integration base. Diff whitespace checks passed.
-- New implementation review, PR CI and revised draft delivery pending.
+- Internal full-delta implementation preflight on the selected integration base:
+  direction sound, no findings. Production differences, retained base contracts,
+  deep fixture, actual receiver proof and documentation checked read-only.
+- External round2 of this PR, PR CI and revised draft delivery pending.
