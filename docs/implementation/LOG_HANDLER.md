@@ -72,8 +72,11 @@ mix test test/otel_metric_exporter/protocol_test.exs test/otel_metric_exporter/l
 All 72 tests passed; the last two files verify retained accumulator and handler
 lifecycle compatibility. Four encoder regressions failed on the uncorrected
 integration encoder. `mix format --check-formatted` and diff whitespace checks
-passed. The dependency lock is unchanged from the integration base. The revised
-implementation review and PR CI are pending.
+passed. The dependency lock is unchanged from the integration base. CI on candidate `e6f2b4d` passed formatting and the full suite (212 tests,
+zero failures) on the workflow's OTP28.4 / Elixir1.19.5 toolchain:
+[CI run](https://github.com/githits-com/elixir-otel-metric-exporter/actions/runs/36999675154).
+The internal review, Claude review and single fresh-context final check found
+no code issues; minor documentation notes were applied before delivery.
 
 Receiver tests use normal Logger translation, loopback Bypass and gzip/protobuf
 decoding. Both report families must deliver traced and trace-free, followed by
@@ -98,9 +101,5 @@ Backend filter repair is merged/deployed per independent handoff; later adoption
 needs the reviewed immutable merged exporter SHA and delivery through its filter.
 An unmerged candidate or component liveness alone does not close the incident.
 
-Planning had three external rounds, findings incorporated and clean internal
-closure but no clean external post-correction check. Main-candidate implementation
-round1 had only a low doc finding, corrected under the doc-only rule; it is
-superseded by this base correction. Revised implementation review is recorded in
-the PR. Keep the temporary plan through review, then transfer durable facts here
-and delete the plan in the final implementation commit.
+Review history and the completed temporary plan's lifecycle are recorded in
+[PR #4](https://github.com/githits-com/elixir-otel-metric-exporter/pull/4).

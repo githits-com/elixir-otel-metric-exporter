@@ -13,7 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler; preserve genuine liveness/load failures and exits/throws.
 - Report the known preparation stage in bounded callback diagnostics even when
   the retained stack is truncated.
-
 - Encode valid Logger report maps with nested structs or arbitrary term keys
   without detaching the log handler.
 - Emit bounded telemetry for contained preparation errors and escaping Logger
