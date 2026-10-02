@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Encode complete proper mixed lists as arrays and improper list values as
+  inspected strings, preserving keyword order, duplicate keys and empty arrays.
+- Contain Logger preparation errors so one malformed event does not detach the
+  handler; preserve genuine liveness/load failures and exits/throws.
+- Report the known preparation stage in bounded callback diagnostics even when
+  the retained stack is truncated.
 - Encode valid Logger report maps with nested structs or arbitrary term keys
   without detaching the log handler.
-- Emit bounded telemetry before preserving a Logger callback failure so handler
-  removal can be diagnosed without exposing log or transport data.
+- Emit bounded telemetry for contained preparation errors and escaping Logger
+  callback failures without exposing log or transport data.
 - Add bounded completion telemetry for log and metric export batches.
 - Make disabled exporters inert and reject live log transport changes that
   would invalidate their startup resources.

@@ -39,15 +39,26 @@ defmodule OtelMetricExporter.OtlpUtils do
   def to_kv_value(value) when is_float(value), do: {:double_value, value}
   def to_kv_value(value) when is_struct(value), do: {:string_value, inspect(value)}
 
-  def to_kv_value([{k, _} | _] = value) when is_atom(k),
-    do: {:kvlist_value, %KeyValueList{values: build_kv(value)}}
+  def to_kv_value(value) when is_list(value) do
+    cond do
+      not proper_list?(value) ->
+        to_kv_value(inspect(value))
 
-  def to_kv_value(value) when is_list(value),
-    do: {:array_value, %ArrayValue{values: Enum.map(value, &%AnyValue{value: to_kv_value(&1)})}}
+      value != [] and Keyword.keyword?(value) ->
+        {:kvlist_value, %KeyValueList{values: build_kv(value)}}
+
+      true ->
+        {:array_value, %ArrayValue{values: Enum.map(value, &%AnyValue{value: to_kv_value(&1)})}}
+    end
+  end
 
   def to_kv_value(value) when is_tuple(value), do: to_kv_value(Tuple.to_list(value))
   def to_kv_value(value) when is_pid(value), do: to_kv_value(inspect(value))
   def to_kv_value(any), do: to_kv_value(inspect(any))
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_ | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
 
   @spec key_to_string(term()) :: String.t()
   defp key_to_string(key) do

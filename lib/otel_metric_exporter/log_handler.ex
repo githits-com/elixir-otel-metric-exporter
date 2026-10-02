@@ -289,13 +289,25 @@ defmodule OtelMetricExporter.LogHandler do
 
     try do
       true = Process.alive?(olp_pid)
-      :logger_olp.load(olp, LogAccumulator.prepare_log_event(event, config))
+
+      case prepare_log_event(event, config, olp_pid) do
+        {:ok, prepared} -> :logger_olp.load(olp, prepared)
+        :error -> :ok
+      end
     catch
       kind, reason ->
         stacktrace = __STACKTRACE__
         LogHandlerFailureTelemetry.emit(event, olp_pid, kind, reason, stacktrace)
         :erlang.raise(kind, reason, stacktrace)
     end
+  end
+
+  defp prepare_log_event(event, config, olp_pid) do
+    {:ok, LogAccumulator.prepare_log_event(event, config)}
+  rescue
+    error ->
+      LogHandlerFailureTelemetry.emit(event, olp_pid, :error, error, __STACKTRACE__, :prepare)
+      :error
   end
 
   @impl true

@@ -7,6 +7,31 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
   @event [:otel_metric_exporter, :log_handler, :exception]
   @secret "authorization=secret-placeholder"
 
+  defmodule FailingReport do
+    @behaviour Access
+    defstruct [:kind]
+
+    @impl true
+    def fetch(report, _key), do: fail(report.kind)
+    @impl true
+    def get_and_update(report, _key, _function), do: fail(report.kind)
+    @impl true
+    def pop(report, _key), do: fail(report.kind)
+
+    defp fail(:deep_error),
+      do: deep_error(16, fn -> raise ArgumentError, "synthetic deep preparation error" end)
+
+    defp fail(:throw), do: throw(:synthetic_prepare_throw)
+    defp fail(:exit), do: exit(:synthetic_prepare_exit)
+
+    # Public test-local entry prevents the compiler proving a private callback
+    # never returns and eliminating the frames this fixture needs.
+    def deep_error(0, callback), do: callback.()
+    # Alternate non-tail call sites so the retained stack really hides Protocol.
+    def deep_error(depth, callback), do: [deep_step(depth - 1, callback)]
+    defp deep_step(depth, callback), do: [deep_error(depth, callback)]
+  end
+
   setup do
     handler_id = {__MODULE__, make_ref()}
 
@@ -27,9 +52,8 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
   test "reports invalid trace context without copying the log event" do
     event = log_event({:string, @secret}, %{otel_trace_id: "not-hex"})
 
-    assert_raise ArgumentError, fn ->
-      LogHandler.log(event, handler_config({:test_olp, self(), make_ref()}))
-    end
+    assert :ok = LogHandler.log(event, handler_config({:test_olp, self(), make_ref()}))
+    refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
 
     assert_receive {:handler_exception, @event, measurements, metadata}
     assert measurements == %{count: 1}
@@ -49,13 +73,8 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
   test "reports unsupported report bodies without copying exception details" do
     event = log_event({:report, @secret})
 
-    try do
-      LogHandler.log(event, handler_config({:test_olp, self(), make_ref()}))
-      flunk("expected report conversion to fail")
-    catch
-      :error, %Protocol.UndefinedError{} ->
-        assert [{Enumerable, :impl_for!, 1, _} | _] = __STACKTRACE__
-    end
+    assert :ok = LogHandler.log(event, handler_config({:test_olp, self(), make_ref()}))
+    refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
 
     assert_receive {:handler_exception, @event, measurements, metadata}
     assert measurements == %{count: 1}
@@ -92,6 +111,95 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
              stage: :olp_liveness,
              trace_context: :missing
            }
+
+    refute_receive {:handler_exception, @event, _, _}, 0
+  end
+
+  test "contains a deep preparation error even without a retained Protocol frame" do
+    report = %FailingReport{kind: :deep_error}
+    event = log_event({:report, report})
+    config = handler_config({:test_olp, self(), make_ref()})
+
+    stacktrace =
+      try do
+        OtelMetricExporter.Protocol.prepare_log_event(event, config.config)
+        flunk("expected the synthetic deep Access callback to fail preparation")
+      rescue
+        _error in ArgumentError -> __STACKTRACE__
+      end
+
+    refute Enum.any?(stacktrace, fn {module, _, _, _} ->
+             module == OtelMetricExporter.Protocol
+           end)
+
+    assert :ok = LogHandler.log(event, config)
+    assert_receive {:handler_exception, @event, %{count: 1}, metadata}
+    assert metadata.stage == :prepare
+    assert metadata.failure_source == :unknown
+    assert metadata.exception == :argument_error
+    assert metadata.message_shape == :report_struct
+    assert metadata.trace_context == :missing
+    assert metadata.olp_alive
+    refute inspect(metadata) =~ @secret
+    refute_receive {:handler_exception, @event, _, _}, 0
+    refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
+  end
+
+  test "preserves an actual load failure with the original stack and one diagnostic" do
+    mode_ref = {__MODULE__, make_ref()}
+    :persistent_term.put(mode_ref, :invalid_mode)
+
+    try do
+      stacktrace =
+        try do
+          LogHandler.log(
+            log_event({:string, "safe"}),
+            handler_config({:test_olp, self(), mode_ref})
+          )
+
+          flunk("expected the synthetic invalid OLP mode to fail loading")
+        rescue
+          _error in CaseClauseError -> __STACKTRACE__
+        end
+
+      assert [{:logger_olp, :load, 2, _} | _] = stacktrace
+      assert_receive {:handler_exception, @event, %{count: 1}, metadata}
+      assert metadata.stage == :load
+      assert metadata.failure_source == :olp
+      assert metadata.exception == :case_clause
+      assert metadata.olp_alive
+      refute_receive {:handler_exception, @event, _, _}, 0
+      refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
+    after
+      :persistent_term.erase(mode_ref)
+    end
+  end
+
+  test "preparation throws and exits preserve kind, reason and stack rather than being contained" do
+    for {kind, reason} <- [throw: :synthetic_prepare_throw, exit: :synthetic_prepare_exit] do
+      result =
+        try do
+          LogHandler.log(
+            log_event({:report, %FailingReport{kind: kind}}),
+            handler_config({:test_olp, self(), make_ref()})
+          )
+        catch
+          caught_kind, caught_reason -> {caught_kind, caught_reason, __STACKTRACE__}
+        end
+
+      assert {^kind, ^reason, stacktrace} = result
+      assert [{FailingReport, _, _, _} | _] = stacktrace
+
+      assert Enum.any?(stacktrace, fn {module, function, _, _} ->
+               module == OtelMetricExporter.Protocol and function == :encode_body
+             end)
+
+      assert_receive {:handler_exception, @event, %{count: 1}, metadata}
+      assert metadata.exception == kind
+      assert metadata.message_shape == :report_struct
+      refute_receive {:handler_exception, @event, _, _}, 0
+      refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
+    end
   end
 
   test "collapses unknown failure inputs to fixed values" do
@@ -156,11 +264,18 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert_raise ArgumentError, fn -> LogHandler.log(event, config) end
+    assert :ok = LogHandler.log(event, config)
 
     assert_receive :reentered_handler
     assert_receive {:handler_exception, @event, %{count: 1}, _metadata}
-    refute_receive {:handler_exception, @event, _measurements, _metadata}
+    refute_receive {:handler_exception, @event, _measurements, _metadata}, 0
+
+    # The process-local guard must be cleared after the first emission.
+    assert :ok = LogHandler.log(event, config)
+    assert_receive :reentered_handler
+    assert_receive {:handler_exception, @event, %{count: 1}, _metadata}
+    refute_receive {:handler_exception, @event, _measurements, _metadata}, 0
+    refute_receive {:"$gen_cast", {:"$olp_load", _}}, 0
   end
 
   test "classifies binary, charlist, and partial trace context" do
@@ -235,11 +350,8 @@ defmodule OtelMetricExporter.LogHandlerFailureTelemetryTest do
   end
 
   def reenter_handler(_event, _measurements, _metadata, {parent, event, config}) do
-    try do
-      LogHandler.log(event, config)
-    catch
-      _kind, _reason -> send(parent, :reentered_handler)
-    end
+    :ok = LogHandler.log(event, config)
+    send(parent, :reentered_handler)
   end
 
   defp handler_config(olp) do
