@@ -83,6 +83,13 @@ defmodule OtelMetricExporter.OtelApi.Config do
       type: {:map, {:or, [:atom, :string]}, :any},
       default: %{},
       doc: "Resource attributes to send with collected data."
+    ],
+    metric_resource_attribute_allowlist: [
+      type: {:list, :string},
+      doc:
+        "Exact normalized resource attribute names to retain for metrics after all resource " <>
+          "configuration is merged. Omit to retain all attributes; [] retains none. " <>
+          "Does not affect logs or traces."
     ]
   ]
 
@@ -392,8 +399,12 @@ defmodule OtelMetricExporter.OtelApi.Config do
       case Map.get(with_overrides, :exporter) do
         x when x in [:otlp, nil] ->
           with {:ok, validated} <- validate(with_overrides, @single_scope_schema) do
-            {:ok, struct!(__MODULE__, Map.put(validated, :otlp_endpoint_kind, endpoint_kind)),
-             rest}
+            validated =
+              validated
+              |> filter_metric_resource(scope)
+              |> Map.put(:otlp_endpoint_kind, endpoint_kind)
+
+            {:ok, struct!(__MODULE__, validated), rest}
           end
 
         :none ->
@@ -424,7 +435,12 @@ defmodule OtelMetricExporter.OtelApi.Config do
 
       {:otlp, endpoint_kind} when endpoint_kind in [:generic, :signal] ->
         with {:ok, validated} <- validate(effective, @single_scope_schema) do
-          {:ok, struct!(__MODULE__, Map.put(validated, :otlp_endpoint_kind, endpoint_kind)), rest}
+          validated =
+            validated
+            |> filter_metric_resource(scope)
+            |> Map.put(:otlp_endpoint_kind, endpoint_kind)
+
+          {:ok, struct!(__MODULE__, validated), rest}
         end
 
       {exporter, _endpoint_kind} ->
@@ -439,6 +455,14 @@ defmodule OtelMetricExporter.OtelApi.Config do
       Map.has_key?(Map.get(defaults, scope, %{}), :otlp_endpoint) -> :signal
       true -> :generic
     end
+  end
+
+  defp filter_metric_resource(config, scope) do
+    {allowlist, config} = Map.pop(config, :metric_resource_attribute_allowlist)
+
+    if scope == :metrics and is_list(allowlist),
+      do: Map.update!(config, :resource, &Map.take(&1, allowlist)),
+      else: config
   end
 
   defp get_for_scope(config, scope),

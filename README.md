@@ -11,6 +11,33 @@ associated.
 
 Of OTel metric types, this currently doesn't support `ExponentialHistogram` and `Summary` metric types.
 
+## Metric resource attributes
+
+By default, metrics retain all resolved resource attributes. To limit metric resource
+cardinality, pass `metric_resource_attribute_allowlist` in the exporter child options:
+
+```elixir
+{OtelMetricExporter,
+ metrics: metrics,
+ metric_resource_attribute_allowlist: [
+   "service.name",
+   "deployment.environment.name",
+   "k8s.cluster.name",
+   "k8s.node.name"
+ ]}
+```
+
+The option accepts a list of exact string keys, using normalized dotted names
+(for example, `%{service: %{name: "api"}}` becomes `"service.name"`). Filtering runs
+after environment (`OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME`), application,
+and explicit resource options are merged, preserving their existing precedence.
+Keys not present in the resolved resource are ignored; no attributes are added.
+An empty list produces an empty metric resource; omitting the option keeps all
+attributes. Logs and traces are unaffected, and no global environment is changed.
+
+You can also set the option in `config :otel_metric_exporter`. An explicit child
+option overrides the application allowlist, including when the child passes `[]`.
+
 ## Installation
 
 If [available in Hex](https://hex.pm/docs/publish), the package can be installed
