@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add opt-in `metric_resource_attribute_allowlist` to restrict final metric
+  resource attributes without affecting logs or traces.
 - Encode complete proper mixed lists as arrays and improper list values as
   inspected strings, preserving keyword order, duplicate keys and empty arrays.
 - Contain Logger preparation errors so one malformed event does not detach the
